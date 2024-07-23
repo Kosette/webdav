@@ -8,27 +8,109 @@ A simple and standalone [WebDAV](https://en.wikipedia.org/wiki/WebDAV) server.
 
 ## Install
 
-Please refer to the [Releases page](https://github.com/hacdias/webdav/releases) for more information. There, you can either download the binaries or find the Docker commands to install WebDAV.
+For a manual install, please refer to the [releases](https://github.com/hacdias/webdav/releases) page and download the correct binary for your system. Alternatively, you can build or install it from source using the Go toolchain. You can either clone the repository and execute `go build`, or directly install it, using:
+
+```
+go install github.com/hacdias/webdav/v4@latest
+```
+
+### Docker
+
+Docker images are provided on both [GitHub's registry](https://github.com/hacdias/webdav/pkgs/container/webdav) and [Docker Hub](https://hub.docker.com/r/hacdias/webdav). You can pull the images using one of the following two commands. Note that this commands pull the latest released version. You can use specific tags to pin specific versions, or use `main` for the development branch.
+
+```bash
+# GitHub Registry
+docker pull ghcr.io/hacdias/webdav:latest
+
+# Docker Hub
+docker pull hacdias/webdav:latest
+```
 
 ## Usage
 
-`webdav` command line interface is really easy to use so you can easily create a WebDAV server for your own user. By default, it runs on a random free port and supports JSON, YAML and TOML configuration. An example of a YAML configuration with the default configurations:
+For usage information regarding the CLI, run `webdav --help`.
+
+### Docker
+
+To use with Docker, you need to provide a configuration file and mount the data directories. For example, let's take the following configuration file that simply sets the port to `6060` and the scope to `/data`.
 
 ```yaml
-# Server related settings
+port: 6060
+scope: /data
+```
+
+You can now run with the following Docker command, where you mount the configuration file inside the container, and the data directory too, as well as forwarding the port 6060. You will need to change this to match your own configuration.
+
+```bash
+docker run \
+  -p 6060:6060 \
+  -v $(pwd)/config.yml:/config.yml:ro \
+  -v $(pwd)/data:/data \
+  ghcr.io/hacdias/webdav -c /config.yml
+```
+
+## Configuration
+
+The configuration can be provided as a YAML, JSON or TOML file. Below is an example of a YAML configuration file with all the options available, as well as what they mean.
+
+```yaml
 address: 0.0.0.0
 port: 0
-auth: true
+
+# TLS-related settings if you want to enable TLS directly.
 tls: false
 cert: cert.pem
 key: key.pem
+
+# Prefix to apply to the WebDAV path-ing. Default is "/".
 prefix: /
+
+# Enable or disable debug logging. Default is false.
 debug: false
 
-# Default user settings (will be merged)
-scope: .
+# Whether or not to have authentication. With authentication on, you need to
+# define one or more users. Default is false.
+auth: true
+
+# The directory that will be able to be accessed by the users when connecting.
+# This directory will be used by users unless they have their own 'scope' defined.
+# Default is "/".
+scope: /
+
+# Whether the users can, by default, modify the contents. Default is false.
 modify: true
+
+# Default permissions rules to apply at the paths.
 rules: []
+
+# The list of users. Must be defined if auth is set to true.
+users:
+  # Example 'admin' user with plaintext password.
+  - username: admin
+    password: admin
+  # Example 'john' user with bcrypt encrypted password, with custom scope.
+  - username: john
+    password: "{bcrypt}$2y$10$zEP6oofmXFeHaeMfBNLnP.DO8m.H.Mwhd24/TOX2MWLxAExXi4qgi"
+    scope: /another/path
+  # Example user whose details will be picked up from the environment.
+  - username: "{env}ENV_USERNAME"
+    password: "{env}ENV_PASSWORD"
+  - username: basic
+    password: basic
+    # Override default modify.
+    modify: false
+    rules:
+      # With this rule, the user CANNOT access /some/files.
+      - path: /some/file
+        allow: false
+      # With this rule, the user CAN modify /public/access.
+      - path: /public/access/
+        modify: true
+      # With this rule, the user CAN modify all files ending with .js. It uses
+      # a regular expression.
+      - path: "^*.js$"
+        regex: true
+        modify: true
 
 # CORS configuration
 cors:
@@ -43,31 +125,7 @@ cors:
   exposed_headers:
     - Content-Length
     - Content-Range
-
-users:
-  - username: admin
-    password: admin
-    scope: /a/different/path
-  - username: encrypted
-    password: "{bcrypt}$2y$10$zEP6oofmXFeHaeMfBNLnP.DO8m.H.Mwhd24/TOX2MWLxAExXi4qgi"
-  - username: "{env}ENV_USERNAME"
-    password: "{env}ENV_PASSWORD"
-  - username: basic
-    password: basic
-    modify: false
-    rules:
-      - regex: false
-        allow: false
-        path: /some/file
-      - path: /public/access/
-        modify: true
 ```
-
-There are more ways to customize how you run WebDAV through flags and environment variables. Please run `webdav --help` for more information on that.
-
-### Systemd
-
-An example of how to use this with `systemd` is on [webdav.service.example](/webdav.service.example).
 
 ### CORS
 
@@ -76,8 +134,11 @@ The `allowed_*` properties are optional, the default value for each of them will
 1. Use `withCredentials = true` in javascript.
 2. Use the `username:password@host` syntax.
 
+## Caveats
+
 ### Reverse Proxy Service
-When you use a reverse proxy implementation like `Nginx` or `Apache`, please note the following fields to avoid causing `502` errors
+
+When using a reverse proxy implementation, like Caddy, Nginx, or Apache, note that you need to forward the correct headers in order to avoid 502 errors. Here's a Nginx configuration example:
 
 ```nginx
 location / {
@@ -88,6 +149,27 @@ location / {
   proxy_set_header Host $http_host;
   proxy_redirect off;
 }
+```
+
+## Examples
+
+### Systemd
+
+Example configuration of a [`systemd`](https://en.wikipedia.org/wiki/Systemd) service:
+
+```conf
+[Unit]
+Description=WebDAV
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/webdav --config /opt/webdav.yml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ## Contributing

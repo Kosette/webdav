@@ -27,6 +27,14 @@ func TestConfigDefaults(t *testing.T) {
 	cfg := writeAndParseConfig(t, "", ".yml")
 	require.NoError(t, cfg.Validate())
 
+	require.EqualValues(t, DefaultAuth, cfg.Auth)
+	require.EqualValues(t, DefaultTLS, cfg.TLS)
+	require.EqualValues(t, DefaultAddress, cfg.Address)
+	require.EqualValues(t, DefaultPort, cfg.Port)
+	require.EqualValues(t, DefaultPrefix, cfg.Prefix)
+	require.EqualValues(t, DefaultLogFormat, cfg.LogFormat)
+	require.NotEmpty(t, cfg.Scope)
+
 	require.EqualValues(t, []string{"*"}, cfg.CORS.AllowedHeaders)
 	require.EqualValues(t, []string{"*"}, cfg.CORS.AllowedHosts)
 	require.EqualValues(t, []string{"*"}, cfg.CORS.AllowedMethods)
@@ -125,7 +133,7 @@ username = "basic"
 password = "basic"
 scope = "/basic"
 modify = false
-rules = [ ]
+rules = []
 `
 
 		cfg := writeAndParseConfig(t, content, ".toml")
@@ -133,4 +141,57 @@ rules = [ ]
 
 		check(t, cfg)
 	})
+}
+
+func TestConfigKeys(t *testing.T) {
+	t.Parallel()
+
+	cfg := writeAndParseConfig(t, `
+cors:
+  enabled: true
+  credentials: true
+  allowed_headers:
+    - Depth
+  allowed_hosts:
+    - http://localhost:8080
+  allowed_methods:
+    - GET
+  exposed_headers:
+    - Content-Length
+    - Content-Range`, ".yml")
+	require.NoError(t, cfg.Validate())
+
+	require.True(t, cfg.CORS.Enabled)
+	require.True(t, cfg.CORS.Credentials)
+	require.EqualValues(t, []string{"Content-Length", "Content-Range"}, cfg.CORS.ExposedHeaders)
+	require.EqualValues(t, []string{"Depth"}, cfg.CORS.AllowedHeaders)
+	require.EqualValues(t, []string{"http://localhost:8080"}, cfg.CORS.AllowedHosts)
+	require.EqualValues(t, []string{"GET"}, cfg.CORS.AllowedMethods)
+}
+
+func TestConfigRules(t *testing.T) {
+	content := `
+auth: false
+scope: /
+modify: true
+rules:
+  - path: '^.+\.js$'
+    regex: true
+    modify: true
+  - path: /public/access/
+    regex: false
+    modify: true`
+
+	cfg := writeAndParseConfig(t, content, ".yaml")
+	require.NoError(t, cfg.Validate())
+
+	require.Len(t, cfg.Rules, 2)
+
+	require.Empty(t, cfg.Rules[0].Path)
+	require.NotNil(t, cfg.Rules[0].Regexp)
+	require.True(t, cfg.Rules[0].Regexp.MatchString("/my/path/to/file.js"))
+	require.False(t, cfg.Rules[0].Regexp.MatchString("/my/path/to/file.ts"))
+
+	require.NotEmpty(t, cfg.Rules[1].Path)
+	require.Nil(t, cfg.Rules[1].Regexp)
 }

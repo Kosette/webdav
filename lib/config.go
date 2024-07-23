@@ -10,6 +10,17 @@ import (
 	"github.com/spf13/viper"
 )
 
+const (
+	DefaultTLS       = false
+	DefaultAuth      = false
+	DefaultCert      = "cert.pem"
+	DefaultKey       = "key.pem"
+	DefaultAddress   = "0.0.0.0"
+	DefaultPort      = 0
+	DefaultPrefix    = "/"
+	DefaultLogFormat = "console"
+)
+
 type Config struct {
 	Permissions `mapstructure:",squash"`
 	Debug       bool
@@ -20,7 +31,7 @@ type Config struct {
 	Key         string
 	Prefix      string
 	NoSniff     bool
-	LogFormat   string
+	LogFormat   string `mapstructure:"log_format"`
 	Auth        bool
 	CORS        CORS
 	Users       []User
@@ -55,10 +66,20 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
-	// Defaults
-	v.SetDefault("CORS.AllowedHeaders", []string{"*"})
-	v.SetDefault("CORS.AllowedHosts", []string{"*"})
-	v.SetDefault("CORS.AllowedMethods", []string{"*"})
+	// Defaults shared with flags
+	v.SetDefault("TLS", DefaultTLS)
+	v.SetDefault("Cert", DefaultCert)
+	v.SetDefault("Key", DefaultKey)
+	v.SetDefault("Address", DefaultAddress)
+	v.SetDefault("Port", DefaultPort)
+	v.SetDefault("Auth", DefaultAuth)
+	v.SetDefault("Prefix", DefaultPrefix)
+	v.SetDefault("Log_Format", DefaultLogFormat)
+
+	// Other defaults
+	v.SetDefault("CORS.Allowed_Headers", []string{"*"})
+	v.SetDefault("CORS.Allowed_Hosts", []string{"*"})
+	v.SetDefault("CORS.Allowed_Methods", []string{"*"})
 
 	// Read and unmarshal configuration
 	err := v.ReadInConfig()
@@ -108,6 +129,11 @@ func (c *Config) Validate() error {
 		return errors.New("invalid config: auth cannot be disabled with users defined")
 	}
 
+	c.Scope, err = filepath.Abs(c.Scope)
+	if err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+
 	if c.TLS {
 		if c.Cert == "" {
 			return errors.New("invalid config: Cert must be defined if TLS is activated")
@@ -146,8 +172,8 @@ func (c *Config) Validate() error {
 type CORS struct {
 	Enabled        bool
 	Credentials    bool
-	AllowedHeaders []string
-	AllowedHosts   []string
-	AllowedMethods []string
-	ExposedHeaders []string
+	AllowedHeaders []string `mapstructure:"allowed_headers"`
+	AllowedHosts   []string `mapstructure:"allowed_hosts"`
+	AllowedMethods []string `mapstructure:"allowed_methods"`
+	ExposedHeaders []string `mapstructure:"exposed_headers"`
 }
