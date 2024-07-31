@@ -47,8 +47,7 @@ jobs:
             ${{ secrets.DOCKER_USERNAME }}/webdav-go
             ghcr.io/Kosette/webdav
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
+            type=raw,value=latest
             type=semver,pattern=v{{version}}
             type=semver,pattern=v{{major}}
             type=semver,pattern=v{{major}}.{{minor}}
