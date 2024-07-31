@@ -11,14 +11,13 @@ COPY ./go.sum ./
 RUN go mod download
 
 COPY . /webdav/
-RUN go build -o main -ldflags="-X 'github.com/hacdias/webdav/v4/cmd.version=$VERSION'" .
+RUN go build -o main -ldflags="-X 'github.com/hacdias/webdav/v5/cmd.version=$VERSION'" .
 
 FROM scratch
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /webdav/main /bin/webdav
 
-EXPOSE 80
+EXPOSE 6065
 
 ENTRYPOINT [ "webdav" ]
-CMD [ "-p", "80" ]

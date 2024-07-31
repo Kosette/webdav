@@ -11,7 +11,7 @@ A simple and standalone [WebDAV](https://en.wikipedia.org/wiki/WebDAV) server.
 For a manual install, please refer to the [releases](https://github.com/hacdias/webdav/releases) page and download the correct binary for your system. Alternatively, you can build or install it from source using the Go toolchain. You can either clone the repository and execute `go build`, or directly install it, using:
 
 ```
-go install github.com/hacdias/webdav/v4@latest
+go install github.com/hacdias/webdav/v5@latest
 ```
 
 ### Docker
@@ -32,11 +32,11 @@ For usage information regarding the CLI, run `webdav --help`.
 
 ### Docker
 
-To use with Docker, you need to provide a configuration file and mount the data directories. For example, let's take the following configuration file that simply sets the port to `6060` and the scope to `/data`.
+To use with Docker, you need to provide a configuration file and mount the data directories. For example, let's take the following configuration file that simply sets the port to `6060` and the directory to `/data`.
 
 ```yaml
 port: 6060
-scope: /data
+directory: /data
 ```
 
 You can now run with the following Docker command, where you mount the configuration file inside the container, and the data directory too, as well as forwarding the port 6060. You will need to change this to match your own configuration.
@@ -55,65 +55,45 @@ The configuration can be provided as a YAML, JSON or TOML file. Below is an exam
 
 ```yaml
 address: 0.0.0.0
-port: 0
+port: 6065
 
 # TLS-related settings if you want to enable TLS directly.
 tls: false
 cert: cert.pem
 key: key.pem
 
-# Prefix to apply to the WebDAV path-ing. Default is "/".
+# Prefix to apply to the WebDAV path-ing. Default is '/'.
 prefix: /
 
-# Enable or disable debug logging. Default is false.
+# Enable or disable debug logging. Default is 'false'.
 debug: false
 
-# Whether or not to have authentication. With authentication on, you need to
-# define one or more users. Default is false.
-auth: true
-
 # The directory that will be able to be accessed by the users when connecting.
-# This directory will be used by users unless they have their own 'scope' defined.
-# Default is "/".
-scope: /
+# This directory will be used by users unless they have their own 'directory' defined.
+# Default is '.' (current directory).
+directory: .
 
-# Whether the users can, by default, modify the contents. Default is false.
-modify: true
+# The default permissions for users. This is a case insensitive option. Possible
+# permissions: C (Create), R (Read), U (Update), D (Delete). You can combine multiple
+# permissions. For example, to allow to read and create, set "RC". Default is "R".
+permissions: R
 
-# Default permissions rules to apply at the paths.
+# The default permissions rules for users. Default is none.
 rules: []
 
-# The list of users. Must be defined if auth is set to true.
-users:
-  # Example 'admin' user with plaintext password.
-  - username: admin
-    password: admin
-  # Example 'john' user with bcrypt encrypted password, with custom scope.
-  - username: john
-    password: "{bcrypt}$2y$10$zEP6oofmXFeHaeMfBNLnP.DO8m.H.Mwhd24/TOX2MWLxAExXi4qgi"
-    scope: /another/path
-  # Example user whose details will be picked up from the environment.
-  - username: "{env}ENV_USERNAME"
-    password: "{env}ENV_PASSWORD"
-  - username: basic
-    password: basic
-    # Override default modify.
-    modify: false
-    rules:
-      # With this rule, the user CANNOT access /some/files.
-      - path: /some/file
-        allow: false
-      # With this rule, the user CAN modify /public/access.
-      - path: /public/access/
-        modify: true
-      # With this rule, the user CAN modify all files ending with .js. It uses
-      # a regular expression.
-      - path: "^*.js$"
-        regex: true
-        modify: true
+# Logging configuration
+log:
+  # Logging format ('console', 'json'). Default is 'console'.
+  format: console
+  # Enable or disable colors. Default is 'true'. Only applied if format is 'console'.
+  colors: true
+  # Logging outputs. You can have more than one output. Default is only 'stderr'.
+  outputs:
+  - stderr
 
 # CORS configuration
 cors:
+  # Whether or not CORS configuration should be applied. Default is 'false'.
   enabled: true
   credentials: true
   allowed_headers:
@@ -125,6 +105,34 @@ cors:
   exposed_headers:
     - Content-Length
     - Content-Range
+
+# The list of users. If users is empty, then there will be no authentication.
+users:
+  # Example 'admin' user with plaintext password.
+  - username: admin
+    password: admin
+  # Example 'john' user with bcrypt encrypted password, with custom directory.
+  - username: john
+    password: "{bcrypt}$2y$10$zEP6oofmXFeHaeMfBNLnP.DO8m.H.Mwhd24/TOX2MWLxAExXi4qgi"
+    directory: /another/path
+  # Example user whose details will be picked up from the environment.
+  - username: "{env}ENV_USERNAME"
+    password: "{env}ENV_PASSWORD"
+  - username: basic
+    password: basic
+    # Override default permissions.
+    permissions: CRUD
+    rules:
+      # With this rule, the user CANNOT access /some/files.
+      - path: /some/file
+        permissions: none
+      # With this rule, the user CAN create, read, update and delete within /public/access.
+      - path: /public/access/
+        permissions: CRUD
+      # With this rule, the user CAN read and update all files ending with .js. It uses
+      # a regular expression.
+      - regex: "^.+.js$"
+        permissions: RU
 ```
 
 ### CORS

@@ -2,6 +2,8 @@ package lib
 
 import (
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 
 	"github.com/rs/cors"
@@ -23,12 +25,12 @@ func NewHandler(c *Config) (http.Handler, error) {
 	h := &Handler{
 		user: &handlerUser{
 			User: User{
-				Permissions: c.Permissions,
+				UserPermissions: c.UserPermissions,
 			},
 			Handler: webdav.Handler{
 				Prefix: c.Prefix,
 				FileSystem: Dir{
-					Dir:     webdav.Dir(c.Scope),
+					Dir:     webdav.Dir(c.Directory),
 					noSniff: c.NoSniff,
 				},
 				LockSystem: webdav.NewMemLS(),
@@ -43,7 +45,7 @@ func NewHandler(c *Config) (http.Handler, error) {
 			Handler: webdav.Handler{
 				Prefix: c.Prefix,
 				FileSystem: Dir{
-					Dir:     webdav.Dir(u.Scope),
+					Dir:     webdav.Dir(u.Directory),
 					noSniff: c.NoSniff,
 				},
 				LockSystem: webdav.NewMemLS(),
@@ -59,6 +61,10 @@ func NewHandler(c *Config) (http.Handler, error) {
 			AllowedHeaders:     c.CORS.AllowedHeaders,
 			OptionsPassthrough: false,
 		}).Handler(h), nil
+	}
+
+	if len(c.Users) == 0 {
+		zap.L().Warn("unprotected config: no users have been set, so no authentication will be used")
 	}
 
 	return h, nil
@@ -96,7 +102,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Checks for user permissions relatively to this PATH.
-	allowed := user.Allowed(r)
+	allowed := user.Allowed(r, func(destination string) bool {
+		u, err := url.Parse(destination)
+		if err != nil {
+			return false
+		}
+		path := strings.TrimPrefix(u.Path, user.Prefix)
+		_, err = user.FileSystem.Stat(r.Context(), path)
+		return !os.IsNotExist(err)
+	})
 
 	zap.L().Debug("allowed & method & path", zap.Bool("allowed", allowed), zap.String("method", r.Method), zap.String("path", r.URL.Path))
 

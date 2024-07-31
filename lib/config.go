@@ -6,35 +6,35 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 const (
-	DefaultTLS       = false
-	DefaultAuth      = false
-	DefaultCert      = "cert.pem"
-	DefaultKey       = "key.pem"
-	DefaultAddress   = "0.0.0.0"
-	DefaultPort      = 0
-	DefaultPrefix    = "/"
-	DefaultLogFormat = "console"
+	DefaultTLS     = false
+	DefaultCert    = "cert.pem"
+	DefaultKey     = "key.pem"
+	DefaultAddress = "0.0.0.0"
+	DefaultPort    = 6065
+	DefaultPrefix  = "/"
 )
 
 type Config struct {
-	Permissions `mapstructure:",squash"`
-	Debug       bool
-	Address     string
-	Port        int
-	TLS         bool
-	Cert        string
-	Key         string
-	Prefix      string
-	NoSniff     bool
-	LogFormat   string `mapstructure:"log_format"`
-	Auth        bool
-	CORS        CORS
-	Users       []User
+	UserPermissions `mapstructure:",squash"`
+	Debug           bool
+	Address         string
+	Port            int
+	TLS             bool
+	Cert            string
+	Key             string
+	Prefix          string
+	NoSniff         bool
+	Log             Log
+	CORS            CORS
+	Users           []User
 }
 
 func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
@@ -43,11 +43,6 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 	// Configure flags bindings
 	if flags != nil {
 		err := v.BindPFlags(flags)
-		if err != nil {
-			return nil, err
-		}
-
-		err = v.BindPFlag("LogFormat", flags.Lookup("log_format"))
 		if err != nil {
 			return nil, err
 		}
@@ -65,6 +60,9 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 	v.SetEnvPrefix("wd")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
+	// TODO: use new env struct bind feature when it's released in viper.
+	// This should make it redundant to set defaults for things that are
+	// empty or false.
 
 	// Defaults shared with flags
 	v.SetDefault("TLS", DefaultTLS)
@@ -72,11 +70,16 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 	v.SetDefault("Key", DefaultKey)
 	v.SetDefault("Address", DefaultAddress)
 	v.SetDefault("Port", DefaultPort)
-	v.SetDefault("Auth", DefaultAuth)
 	v.SetDefault("Prefix", DefaultPrefix)
-	v.SetDefault("Log_Format", DefaultLogFormat)
 
 	// Other defaults
+	v.SetDefault("Directory", ".")
+	v.SetDefault("Permissions", "R")
+	v.SetDefault("Debug", false)
+	v.SetDefault("NoSniff", false)
+	v.SetDefault("Log.Format", "console")
+	v.SetDefault("Log.Outputs", []string{"stderr"})
+	v.SetDefault("Log.Colors", true)
 	v.SetDefault("CORS.Allowed_Headers", []string{"*"})
 	v.SetDefault("CORS.Allowed_Hosts", []string{"*"})
 	v.SetDefault("CORS.Allowed_Methods", []string{"*"})
@@ -90,19 +93,23 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 	}
 
 	cfg := &Config{}
-	err = v.Unmarshal(cfg)
+	err = v.Unmarshal(cfg, viper.DecodeHook(mapstructure.ComposeDecodeHookFunc(
+		mapstructure.StringToTimeDurationHookFunc(),
+		mapstructure.StringToSliceHookFunc(","),
+		mapstructure.TextUnmarshallerHookFunc(),
+	)))
 	if err != nil {
 		return nil, err
 	}
 
 	// Cascade user settings
 	for i := range cfg.Users {
-		if !v.IsSet(fmt.Sprintf("Users.%d.Scope", i)) {
-			cfg.Users[i].Scope = cfg.Scope
+		if !v.IsSet(fmt.Sprintf("Users.%d.Directory", i)) {
+			cfg.Users[i].Directory = cfg.Directory
 		}
 
-		if !v.IsSet(fmt.Sprintf("Users.%d.Modify", i)) {
-			cfg.Users[i].Modify = cfg.Modify
+		if !v.IsSet(fmt.Sprintf("Users.%d.Permissions", i)) {
+			cfg.Users[i].Permissions = cfg.Permissions
 		}
 
 		if !v.IsSet(fmt.Sprintf("Users.%d.Rules", i)) {
@@ -121,15 +128,7 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 func (c *Config) Validate() error {
 	var err error
 
-	if c.Auth && len(c.Users) == 0 {
-		return errors.New("invalid config: auth cannot be enabled without users")
-	}
-
-	if !c.Auth && len(c.Users) != 0 {
-		return errors.New("invalid config: auth cannot be disabled with users defined")
-	}
-
-	c.Scope, err = filepath.Abs(c.Scope)
+	c.Directory, err = filepath.Abs(c.Directory)
 	if err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
@@ -154,7 +153,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	err = c.Permissions.Validate()
+	err = c.UserPermissions.Validate()
 	if err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
@@ -167,6 +166,27 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func (cfg *Config) GetLogger() (*zap.Logger, error) {
+	loggerConfig := zap.NewProductionConfig()
+	loggerConfig.DisableCaller = true
+	if cfg.Debug {
+		loggerConfig.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	}
+	if cfg.Log.Colors && cfg.Log.Format != "json" {
+		loggerConfig.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	}
+	loggerConfig.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	loggerConfig.Encoding = cfg.Log.Format
+	loggerConfig.OutputPaths = cfg.Log.Outputs
+	return loggerConfig.Build()
+}
+
+type Log struct {
+	Format  string
+	Colors  bool
+	Outputs []string
 }
 
 type CORS struct {
