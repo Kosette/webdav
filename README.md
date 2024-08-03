@@ -68,6 +68,9 @@ prefix: /
 # Enable or disable debug logging. Default is 'false'.
 debug: false
 
+# Disable sniffing the files to detect their content type. Default is 'false'.
+noSniff: false
+
 # The directory that will be able to be accessed by the users when connecting.
 # This directory will be used by users unless they have their own 'directory' defined.
 # Default is '.' (current directory).
@@ -106,7 +109,14 @@ cors:
     - Content-Length
     - Content-Range
 
-# The list of users. If users is empty, then there will be no authentication.
+# The list of users. If the list is empty, then there will be no authentication.
+# Otherwise, basic authentication will automatically be configured.
+#
+# If you're delegating the authentication to a different service, you can proxy
+# the username using basic authentication, and then disable webdav's password
+# check using the option:
+#
+# noPassword: true
 users:
   # Example 'admin' user with plaintext password.
   - username: admin
@@ -154,7 +164,7 @@ location / {
   proxy_set_header X-Real-IP $remote_addr;
   proxy_set_header REMOTE-HOST $remote_addr;
   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header Host $http_host;
+  proxy_set_header Host $host;
   proxy_redirect off;
 }
 ```
