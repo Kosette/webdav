@@ -2,7 +2,6 @@ package lib
 
 import (
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 
@@ -116,21 +115,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		zap.L().Info("user authorized", zap.String("username", username), zap.String("remote_address", remoteAddr))
 	}
 
-	// Cleanup destination header if it's present by stripping out the prefix
-	// and only keeping the path.
-	if destination := r.Header.Get("Destination"); destination != "" {
-		u, err := url.Parse(destination)
-		if err == nil {
-			destination = strings.TrimPrefix(u.Path, user.Prefix)
-			if !strings.HasPrefix(destination, "/") {
-				destination = "/" + destination
-			}
-			r.Header.Set("Destination", destination)
-		}
+	// Convert the HTTP request into an internal request type
+	req, err := newRequest(r, h.user.Prefix)
+	if err != nil {
+		zap.L().Info("invalid request path or destination", zap.Error(err))
+		http.Error(w, "Invalid request path or destination", http.StatusBadRequest)
+		return
 	}
 
 	// Checks for user permissions relatively to this PATH.
-	allowed := user.Allowed(r, func(filename string) bool {
+	allowed := user.Allowed(req, func(filename string) bool {
 		_, err := user.FileSystem.Stat(r.Context(), filename)
 		return !os.IsNotExist(err)
 	})
@@ -152,8 +146,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//		"index.html" resource, a human-readable view of the contents of
 	//		the collection, or something else altogether.
 	//
-	// Get, when applied to collection, will return the same as PROPFIND method.
-	if r.Method == "GET" && strings.HasPrefix(r.URL.Path, user.Prefix) {
+	//    Similarly, since the definition of HEAD is a GET without a response
+	// 		message body, the semantics of HEAD are unmodified when applied to
+	// 		collection resources.
+	//
+	// GET (or HEAD), when applied to collection, will return the same as PROPFIND method.
+	if (r.Method == "GET" || r.Method == "HEAD") && strings.HasPrefix(r.URL.Path, user.Prefix) {
 		info, err := user.FileSystem.Stat(r.Context(), strings.TrimPrefix(r.URL.Path, user.Prefix))
 		if err == nil && info.IsDir() {
 			r.Method = "PROPFIND"
@@ -183,5 +181,5 @@ type responseWriterNoBody struct {
 }
 
 func (w responseWriterNoBody) Write(data []byte) (int, error) {
-	return 0, nil
+	return len(data), nil
 }
