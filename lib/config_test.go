@@ -3,6 +3,7 @@ package lib
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -52,19 +53,27 @@ func TestConfigDefaults(t *testing.T) {
 	require.Equal(t, dir, cfg.Directory)
 
 	require.EqualValues(t, []string{"*"}, cfg.CORS.AllowedHosts)
-	require.EqualValues(t, []string{"Authorization", "Content-Type", "Depth", "Destination", "If", "Lock-Token", "Overwrite"}, cfg.CORS.AllowedHeaders)
-	require.EqualValues(t, []string{"COPY", "DELETE", "GET", "HEAD", "LOCK", "MKCOL", "MOVE", "OPTIONS", "POST", "PROPFIND", "PROPPATCH", "PUT", "UNLOCK"}, cfg.CORS.AllowedMethods)
+	require.EqualValues(t, []string{"Authorization", "Content-Type", "Content-Range", "Depth", "Destination", "If", "Lock-Token", "Overwrite", "X-Update-Range"}, cfg.CORS.AllowedHeaders)
+	require.EqualValues(t, []string{"COPY", "DELETE", "GET", "HEAD", "LOCK", "MKCOL", "MOVE", "OPTIONS", "PATCH", "POST", "PROPFIND", "PROPPATCH", "PUT", "UNLOCK"}, cfg.CORS.AllowedMethods)
+	require.False(t, cfg.CORS.AllowPrivateNetwork)
 }
 
 func TestConfigCascade(t *testing.T) {
 	t.Parallel()
+
+	// Directories are resolved to absolute paths, which differ by platform
+	// (for example "/" becomes the current drive root on Windows).
+	rootDirectory, err := filepath.Abs("/")
+	require.NoError(t, err)
+	basicDirectory, err := filepath.Abs("/basic")
+	require.NoError(t, err)
 
 	check := func(t *testing.T, cfg *Config) {
 		require.True(t, cfg.Permissions.Read)
 		require.True(t, cfg.Permissions.Create)
 		require.False(t, cfg.Permissions.Delete)
 		require.False(t, cfg.Permissions.Update)
-		require.Equal(t, "/", cfg.Directory)
+		require.Equal(t, rootDirectory, cfg.Directory)
 		require.Len(t, cfg.Rules, 1)
 
 		require.Len(t, cfg.Users, 2)
@@ -72,14 +81,14 @@ func TestConfigCascade(t *testing.T) {
 		require.True(t, cfg.Users[0].Permissions.Create)
 		require.False(t, cfg.Users[0].Permissions.Delete)
 		require.False(t, cfg.Users[0].Permissions.Update)
-		require.Equal(t, "/", cfg.Users[0].Directory)
+		require.Equal(t, rootDirectory, cfg.Users[0].Directory)
 		require.Len(t, cfg.Users[0].Rules, 1)
 
 		require.True(t, cfg.Users[1].Permissions.Read)
 		require.False(t, cfg.Users[1].Permissions.Create)
 		require.False(t, cfg.Users[1].Permissions.Delete)
 		require.False(t, cfg.Users[1].Permissions.Update)
-		require.Equal(t, "/basic", cfg.Users[1].Directory)
+		require.Equal(t, basicDirectory, cfg.Users[1].Directory)
 		require.Len(t, cfg.Users[1].Rules, 0)
 	}
 
@@ -165,6 +174,182 @@ rules = []
 	})
 }
 
+func TestConfigDirectories(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Mixed Entries", func(t *testing.T) {
+		t.Parallel()
+
+		dirC := t.TempDir()
+		dirD := t.TempDir()
+		dirE := t.TempDir()
+
+		cfg := writeAndParseConfig(t, `
+directories:
+  - `+dirC+`
+  - d2: `+dirD+`
+  - name: archive
+    path: `+dirE+`
+`, ".yml")
+		require.NoError(t, cfg.Validate())
+
+		require.True(t, cfg.useDirectories)
+		require.Equal(t, filepath.Base(dirC), cfg.Directories[0].Name)
+		require.Equal(t, dirC, cfg.Directories[0].Path)
+		require.Equal(t, "d2", cfg.Directories[1].Name)
+		require.Equal(t, dirD, cfg.Directories[1].Path)
+		require.Equal(t, "archive", cfg.Directories[2].Name)
+		require.Equal(t, dirE, cfg.Directories[2].Path)
+	})
+
+	t.Run("JSON", func(t *testing.T) {
+		t.Parallel()
+
+		dirC := t.TempDir()
+		dirD := t.TempDir()
+		dirE := t.TempDir()
+
+		cfg := writeAndParseConfig(t, `{
+	"directories": [
+		`+strconv.Quote(dirC)+`,
+		{ "d2": `+strconv.Quote(dirD)+` },
+		{ "name": "archive", "path": `+strconv.Quote(dirE)+` }
+	]
+}`, ".json")
+		require.NoError(t, cfg.Validate())
+
+		require.True(t, cfg.useDirectories)
+		require.Equal(t, filepath.Base(dirC), cfg.Directories[0].Name)
+		require.Equal(t, dirC, cfg.Directories[0].Path)
+		require.Equal(t, "d2", cfg.Directories[1].Name)
+		require.Equal(t, dirD, cfg.Directories[1].Path)
+		require.Equal(t, "archive", cfg.Directories[2].Name)
+		require.Equal(t, dirE, cfg.Directories[2].Path)
+	})
+
+	t.Run("TOML", func(t *testing.T) {
+		t.Parallel()
+
+		dirD := t.TempDir()
+		dirE := t.TempDir()
+
+		cfg := writeAndParseConfig(t, `
+[[directories]]
+d2 = `+strconv.Quote(dirD)+`
+
+[[directories]]
+name = "archive"
+path = `+strconv.Quote(dirE)+`
+`, ".toml")
+		require.NoError(t, cfg.Validate())
+
+		require.True(t, cfg.useDirectories)
+		require.Equal(t, "d2", cfg.Directories[0].Name)
+		require.Equal(t, dirD, cfg.Directories[0].Path)
+		require.Equal(t, "archive", cfg.Directories[1].Name)
+		require.Equal(t, dirE, cfg.Directories[1].Path)
+	})
+
+	t.Run("Mutually Exclusive Global Directory Fields", func(t *testing.T) {
+		t.Parallel()
+
+		writeAndParseConfigWithError(t, `
+directory: /tmp
+directories:
+  - /tmp
+`, ".yml", "directory and directories cannot both be defined")
+	})
+
+	t.Run("Mutually Exclusive User Directory Fields", func(t *testing.T) {
+		t.Parallel()
+
+		writeAndParseConfigWithError(t, `
+users:
+  - username: basic
+    password: basic
+    directory: /tmp
+    directories:
+      - /tmp
+`, ".yml", "cannot define both directory and directories")
+	})
+
+	t.Run("Duplicate Mount Names", func(t *testing.T) {
+		t.Parallel()
+
+		parent := t.TempDir()
+		dir := filepath.Join(parent, "dup")
+		require.NoError(t, os.Mkdir(dir, 0775))
+
+		writeAndParseConfigWithError(t, `
+directories:
+  - `+dir+`
+  - dup: /tmp
+`, ".yml", "duplicate mount name")
+	})
+
+	t.Run("Cascade Mode", func(t *testing.T) {
+		t.Parallel()
+
+		global := t.TempDir()
+		single := t.TempDir()
+		userMulti := t.TempDir()
+
+		cfg := writeAndParseConfig(t, `
+directories:
+  - global: `+global+`
+users:
+  - username: inherited
+    password: inherited
+  - username: single
+    password: single
+    directory: `+single+`
+  - username: multi
+    password: multi
+    directories:
+      - owned: `+userMulti+`
+`, ".yml")
+		require.NoError(t, cfg.Validate())
+
+		require.True(t, cfg.useDirectories)
+		require.True(t, cfg.Users[0].useDirectories)
+		require.Equal(t, DirectoryMounts{{Name: "global", Path: global}}, cfg.Users[0].Directories)
+		require.False(t, cfg.Users[1].useDirectories)
+		require.Equal(t, single, cfg.Users[1].Directory)
+		require.True(t, cfg.Users[2].useDirectories)
+		require.Equal(t, DirectoryMounts{{Name: "owned", Path: userMulti}}, cfg.Users[2].Directories)
+	})
+}
+
+func TestConfigDirectoriesEnvOverrides(t *testing.T) {
+	global := t.TempDir()
+	single := t.TempDir()
+	userMulti := t.TempDir()
+
+	t.Setenv("WD_DIRECTORIES", global)
+	t.Setenv("WD_USERS_1_DIRECTORY", single)
+	t.Setenv("WD_USERS_2_DIRECTORIES", userMulti)
+
+	cfg := writeAndParseConfig(t, `
+users:
+  - username: inherited
+    password: inherited
+  - username: single
+    password: single
+  - username: multi
+    password: multi
+`, ".yml")
+	require.NoError(t, cfg.Validate())
+
+	require.True(t, cfg.useDirectories)
+	require.Equal(t, DirectoryMounts{{Name: filepath.Base(global), Path: global}}, cfg.Directories)
+	require.True(t, cfg.Users[0].useDirectories)
+	require.Equal(t, DirectoryMounts{{Name: filepath.Base(global), Path: global}}, cfg.Users[0].Directories)
+	require.False(t, cfg.Users[1].useDirectories)
+	require.Equal(t, single, cfg.Users[1].Directory)
+	require.True(t, cfg.Users[2].useDirectories)
+	require.Equal(t, DirectoryMounts{{Name: filepath.Base(userMulti), Path: userMulti}}, cfg.Users[2].Directories)
+}
+
 func TestConfigKeys(t *testing.T) {
 	t.Parallel()
 
@@ -172,6 +357,7 @@ func TestConfigKeys(t *testing.T) {
 cors:
   enabled: true
   credentials: true
+  allow_private_network: true
   allowed_headers:
     - Depth
   allowed_hosts:
@@ -185,6 +371,7 @@ cors:
 
 	require.True(t, cfg.CORS.Enabled)
 	require.True(t, cfg.CORS.Credentials)
+	require.True(t, cfg.CORS.AllowPrivateNetwork)
 	require.EqualValues(t, []string{"Content-Length", "Content-Range"}, cfg.CORS.ExposedHeaders)
 	require.EqualValues(t, []string{"Depth"}, cfg.CORS.AllowedHeaders)
 	require.EqualValues(t, []string{"http://localhost:8080"}, cfg.CORS.AllowedHosts)
@@ -308,8 +495,11 @@ func TestConfigEnv(t *testing.T) {
 	cfg, err := ParseConfig("", nil)
 	require.NoError(t, err)
 
+	expectedDirectory, err := filepath.Abs("/test")
+	require.NoError(t, err)
+
 	assert.Equal(t, 1234, cfg.Port)
-	assert.Equal(t, "/test", cfg.Directory)
+	assert.Equal(t, expectedDirectory, cfg.Directory)
 	assert.Equal(t, true, cfg.Debug)
 	require.True(t, cfg.Permissions.Read)
 	require.True(t, cfg.Permissions.Create)
