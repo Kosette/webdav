@@ -40,6 +40,7 @@ type Config struct {
 	BehindProxy     bool
 	Log             Log
 	CORS            CORS
+	Listing         Listing
 	Users           []User
 }
 
@@ -92,6 +93,13 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 	v.SetDefault("CORS.Allowed_Hosts", []string{"*"})
 	v.SetDefault("CORS.Allowed_Headers", []string{"Authorization", "Content-Type", "Content-Range", "Depth", "Destination", "If", "Lock-Token", "Overwrite", "X-Update-Range"})
 	v.SetDefault("CORS.Allowed_Methods", []string{"COPY", "DELETE", "GET", "HEAD", "LOCK", "MKCOL", "MOVE", "OPTIONS", "PATCH", "POST", "PROPFIND", "PROPPATCH", "PUT", "UNLOCK"})
+	v.SetDefault("Listing.Enabled", false)
+	v.SetDefault("Listing.Hide_Parent_Dir", false)
+	v.SetDefault("Listing.Show_Path", true)
+	v.SetDefault("Listing.Header", "")
+	v.SetDefault("Listing.Header_File", "")
+	v.SetDefault("Listing.Footer", "")
+	v.SetDefault("Listing.Footer_File", "")
 
 	// Read and unmarshal configuration
 	err := v.ReadInConfig()
@@ -134,15 +142,33 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 			return nil, fmt.Errorf("invalid config: user %q: %w", cfg.Users[i].Username, err)
 		}
 
-		if !v.IsSet(fmt.Sprintf("Users.%d.Permissions", i)) {
+		// Viper does not apply environment variables to fields of slice elements
+		// when unmarshaling, so explicitly set values are read back with Get.
+		userPermissionsKey := fmt.Sprintf("Users.%d.Permissions", i)
+		if isExplicitlySet(v, flags, userPermissionsKey) {
+			permissions := Permissions{}
+			err := permissions.UnmarshalText([]byte(v.GetString(userPermissionsKey)))
+			if err != nil {
+				return nil, fmt.Errorf("invalid config: user %q: %w", cfg.Users[i].Username, err)
+			}
+			cfg.Users[i].Permissions = permissions
+		} else {
 			cfg.Users[i].Permissions = cfg.Permissions
 		}
 
-		if !v.IsSet(fmt.Sprintf("Users.%d.RulesBehavior", i)) {
+		userRulesBehaviorKey := fmt.Sprintf("Users.%d.RulesBehavior", i)
+		if isExplicitlySet(v, flags, userRulesBehaviorKey) {
+			cfg.Users[i].RulesBehavior = RulesBehavior(v.GetString(userRulesBehaviorKey))
+		} else {
 			cfg.Users[i].RulesBehavior = cfg.RulesBehavior
 		}
 
-		if v.IsSet(fmt.Sprintf("Users.%d.Rules", i)) {
+		userRulesKey := fmt.Sprintf("Users.%d.Rules", i)
+		if os.Getenv(envKey(userRulesKey)) != "" {
+			return nil, fmt.Errorf("invalid config: user %q: rules cannot be set via environment variables", cfg.Users[i].Username)
+		}
+
+		if isExplicitlySet(v, flags, userRulesKey) {
 			switch cfg.Users[i].RulesBehavior {
 			case RulesOverwrite:
 				// Do nothing
@@ -200,9 +226,12 @@ func isExplicitlySet(v *viper.Viper, flags *pflag.FlagSet, key string) bool {
 		return true
 	}
 
-	envKey := "WD_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
-	value, ok := os.LookupEnv(envKey)
+	value, ok := os.LookupEnv(envKey(key))
 	return ok && value != ""
+}
+
+func envKey(key string) string {
+	return "WD_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
 }
 
 func (c *Config) Validate() error {
@@ -238,11 +267,22 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
+	err = c.Listing.Load()
+	if err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+
+	usernames := map[string]struct{}{}
 	for i := range c.Users {
 		err := c.Users[i].Validate(c.NoPassword)
 		if err != nil {
 			return fmt.Errorf("invalid config: %w", err)
 		}
+
+		if _, ok := usernames[c.Users[i].Username]; ok {
+			return fmt.Errorf("invalid config: duplicate username %q", c.Users[i].Username)
+		}
+		usernames[c.Users[i].Username] = struct{}{}
 	}
 
 	return nil
@@ -390,4 +430,45 @@ type CORS struct {
 	AllowedHosts        []string `mapstructure:"allowed_hosts"`
 	AllowedMethods      []string `mapstructure:"allowed_methods"`
 	ExposedHeaders      []string `mapstructure:"exposed_headers"`
+}
+
+// Listing.Header and Footer, when set, replace the entire outer HTML
+// document shell (doctype, <html>, <head>, <body> open/close) instead of
+// being inserted as fragments inside a default shell: Header must contain
+// the full opening, up to and including <body>, and Footer must contain the
+// full closing, i.e. </body></html>. They must be configured together.
+type Listing struct {
+	Enabled       bool
+	HideParentDir bool `mapstructure:"hide_parent_dir"`
+	ShowPath      bool `mapstructure:"show_path"`
+	Header        string
+	HeaderFile    string `mapstructure:"header_file"`
+	Footer        string
+	FooterFile    string `mapstructure:"footer_file"`
+}
+
+var errHeaderFooterMismatch = errors.New("listing: header and footer must both be set, or both left empty")
+
+func (bl *Listing) Load() error {
+	if bl.HeaderFile != "" {
+		content, err := os.ReadFile(bl.HeaderFile)
+		if err != nil {
+			return fmt.Errorf("failed to read header file: %w", err)
+		}
+		bl.Header = string(content)
+	}
+
+	if bl.FooterFile != "" {
+		content, err := os.ReadFile(bl.FooterFile)
+		if err != nil {
+			return fmt.Errorf("failed to read footer file: %w", err)
+		}
+		bl.Footer = string(content)
+	}
+
+	if (bl.Header == "") != (bl.Footer == "") {
+		return errHeaderFooterMismatch
+	}
+
+	return nil
 }

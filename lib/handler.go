@@ -3,6 +3,8 @@ package lib
 import (
 	"net/http"
 	"os"
+	"path"
+	"strings"
 
 	"github.com/rs/cors"
 	"go.uber.org/zap"
@@ -18,6 +20,7 @@ type handlerUser struct {
 type Handler struct {
 	noPassword  bool
 	behindProxy bool
+	listing     Listing
 	user        *handlerUser
 	users       map[string]*handlerUser
 }
@@ -33,6 +36,7 @@ func NewHandler(c *Config) (http.Handler, error) {
 	h := &Handler{
 		noPassword:  c.NoPassword,
 		behindProxy: c.BehindProxy,
+		listing:     c.Listing,
 		user:        newHandlerUser(User{UserPermissions: c.UserPermissions}, c, ls, logFunc),
 		users:       map[string]*handlerUser{},
 	}
@@ -169,8 +173,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// MOVE and DELETE act on a whole subtree in one call, so every descendant
-	// needs authorizing here. COPY and PROPFIND go through permFS instead.
+	// MOVE and DELETE act on a whole source subtree in one call, so every
+	// descendant needs authorizing here. Reading COPY and PROPFIND out of the
+	// source goes through permFS instead.
 	if r.Method == "MOVE" || r.Method == "DELETE" {
 		ok, err := user.fs.allowedThroughout(r.Context(), req.path, func(p Permissions) bool {
 			return p.Allowed(req, fileExists)
@@ -188,6 +193,50 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Excerpt from RFC4918, section 9.9.3, on MOVE:
+	//
+	//		If a resource exists at the destination and the Overwrite header is
+	//		"T", then prior to performing the move, the server MUST perform a
+	//		DELETE with "Depth: infinity" on the destination resource.
+	//
+	// And from section 9.8.4, on COPY:
+	//
+	//		When a collection is overwritten, the membership of the destination
+	//		collection after the successful COPY request MUST be the same
+	//		membership as the source collection immediately before the COPY.
+	//
+	// Either way whatever the destination collection held is gone, which
+	// golang.org/x/net/webdav carries out as a RemoveAll before the rename or
+	// the copy. Writing over a file is an update, already authorized by Allowed,
+	// but removing a collection takes everything under it. Nothing writes to
+	// those descendants, they are only destroyed, so authorize the destination
+	// the way DELETE on that collection would be.
+	if (r.Method == "MOVE" || r.Method == "COPY") && req.destination != "" {
+		info, err := user.fs.Stat(r.Context(), req.destination)
+		if err == nil && info.IsDir() {
+			deletable := func(p Permissions) bool { return p.Delete }
+
+			// allowedThroughout reaches descendants only, and the destination
+			// check in Allowed covers the collection itself as an update rather
+			// than a delete, so that is checked here.
+			ok := user.allowedAt(req.destination, deletable)
+			if ok {
+				ok, err = user.fs.allowedThroughout(r.Context(), req.destination, deletable)
+				if err != nil {
+					lZap.Error("could not authorize destination subtree", zap.String("destination", req.destination), zap.Error(err))
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+			}
+
+			if !ok {
+				lZap.Info("denied by a rule on the destination collection", zap.String("method", r.Method), zap.String("destination", req.destination))
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+		}
+	}
+
 	if r.Method == "HEAD" {
 		w = responseWriterNoBody{w}
 	}
@@ -202,10 +251,51 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 		message body, the semantics of HEAD are unmodified when applied to
 	// 		collection resources.
 	//
-	// GET (or HEAD), when applied to collection, will return the same as PROPFIND method.
+	// GET (or HEAD), when applied to collection, will serve directory listing
+	// if listing is enabled, otherwise return same as PROPFIND method.
 	if r.Method == "GET" || r.Method == "HEAD" {
 		info, err := user.fs.Stat(r.Context(), req.path)
 		if err == nil && info.IsDir() {
+			if h.listing.Enabled {
+				// The listing uses relative links, which only resolve correctly
+				// under a trailing slash. The target is relative so http.Redirect
+				// cleans it, keeping a path such as "//host" from leaving the site.
+				if !strings.HasSuffix(r.URL.Path, "/") {
+					target := "./" + path.Base(r.URL.EscapedPath()) + "/"
+					if r.URL.RawQuery != "" {
+						target += "?" + r.URL.RawQuery
+					}
+					http.Redirect(w, r, target, http.StatusMovedPermanently)
+					return
+				}
+
+				sorting := ParseListingSortQuery(r.URL.Query())
+				html, err := RenderListing(
+					r.Context(),
+					user.fs,
+					req.path,
+					sorting,
+					h.listing,
+				)
+				if err != nil {
+					lZap.Error("failed to render directory listing", zap.Error(err))
+					http.Error(w, "Failed to render directory listing", http.StatusInternalServerError)
+					return
+				}
+
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				if r.Method == "GET" {
+					w.WriteHeader(http.StatusOK)
+					if _, err := w.Write([]byte(html)); err != nil {
+						lZap.Error("failed to write directory listing", zap.Error(err))
+					}
+				} else {
+					// HEAD: write headers only
+					w.WriteHeader(http.StatusOK)
+				}
+				return
+			}
+
 			r.Method = "PROPFIND"
 
 			if r.Header.Get("Depth") == "" {

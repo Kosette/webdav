@@ -55,7 +55,44 @@ func TestConfigDefaults(t *testing.T) {
 	require.EqualValues(t, []string{"*"}, cfg.CORS.AllowedHosts)
 	require.EqualValues(t, []string{"Authorization", "Content-Type", "Content-Range", "Depth", "Destination", "If", "Lock-Token", "Overwrite", "X-Update-Range"}, cfg.CORS.AllowedHeaders)
 	require.EqualValues(t, []string{"COPY", "DELETE", "GET", "HEAD", "LOCK", "MKCOL", "MOVE", "OPTIONS", "PATCH", "POST", "PROPFIND", "PROPPATCH", "PUT", "UNLOCK"}, cfg.CORS.AllowedMethods)
+	require.False(t, cfg.Listing.Enabled)
+	require.False(t, cfg.Listing.HideParentDir)
+	require.True(t, cfg.Listing.ShowPath)
 	require.False(t, cfg.CORS.AllowPrivateNetwork)
+}
+
+func TestConfigListingHeaderFooterMustBeSetTogether(t *testing.T) {
+	t.Parallel()
+
+	writeAndParseConfigWithError(t, `
+listing:
+  header: "<html><body>"
+`, ".yml", "header and footer must both be set")
+
+	writeAndParseConfigWithError(t, `
+listing:
+  footer: "</body></html>"
+`, ".yml", "header and footer must both be set")
+
+	cfg := writeAndParseConfig(t, `
+listing:
+  header: "<html><body>"
+  footer: "</body></html>"
+`, ".yml")
+	require.NoError(t, cfg.Validate())
+}
+
+func TestConfigListingEnvOverrides(t *testing.T) {
+	t.Setenv("WD_LISTING_HIDE_PARENT_DIR", "true")
+	t.Setenv("WD_LISTING_HEADER", "<html><body>")
+	t.Setenv("WD_LISTING_FOOTER", "</body></html>")
+
+	cfg := writeAndParseConfig(t, "", ".yml")
+	require.NoError(t, cfg.Validate())
+
+	require.True(t, cfg.Listing.HideParentDir)
+	require.Equal(t, "<html><body>", cfg.Listing.Header)
+	require.Equal(t, "</body></html>", cfg.Listing.Footer)
 }
 
 func TestConfigCascade(t *testing.T) {
@@ -350,6 +387,130 @@ users:
 	require.Equal(t, DirectoryMounts{{Name: filepath.Base(userMulti), Path: userMulti}}, cfg.Users[2].Directories)
 }
 
+func TestConfigUserEnvOverrides(t *testing.T) {
+	t.Setenv("WD_USERS_0_PERMISSIONS", "R")
+	t.Setenv("WD_USERS_1_PERMISSIONS", "none")
+	t.Setenv("WD_USERS_1_RULESBEHAVIOR", "overwrite")
+
+	cfg := writeAndParseConfig(t, `
+directory: /
+permissions: CRUD
+rulesBehavior: append
+rules:
+  - path: /secret
+    permissions: none
+users:
+  - username: inherited
+    password: inherited
+  - username: own
+    password: own
+    permissions: CRUD
+    rules:
+      - path: /mine`, ".yml")
+	require.NoError(t, cfg.Validate())
+
+	require.Equal(t, Permissions{Read: true}, cfg.Users[0].Permissions)
+	require.Equal(t, RulesAppend, cfg.Users[0].RulesBehavior)
+	require.Len(t, cfg.Users[0].Rules, 1)
+	require.Equal(t, "/secret", cfg.Users[0].Rules[0].Path)
+
+	require.Equal(t, Permissions{}, cfg.Users[1].Permissions)
+	require.Equal(t, RulesOverwrite, cfg.Users[1].RulesBehavior)
+	require.Len(t, cfg.Users[1].Rules, 1)
+	require.Equal(t, "/mine", cfg.Users[1].Rules[0].Path)
+}
+
+func TestConfigUserRulesEnvRejected(t *testing.T) {
+	t.Setenv("WD_USERS_0_RULES", "placeholder")
+
+	writeAndParseConfigWithError(t, `
+directory: /
+rules:
+  - path: /secret
+    permissions: none
+users:
+  - username: foo
+    password: bar`, ".yml", "rules cannot be set via environment variables")
+}
+
+func TestConfigUserEnvPermissionsNone(t *testing.T) {
+	t.Setenv("WD_USERS_0_PERMISSIONS", "none")
+
+	cfg := writeAndParseConfig(t, `
+directory: /
+permissions: CRUD
+rules:
+  - path: /secret
+    permissions: none
+users:
+  - username: foo
+    password: bar`, ".yml")
+	require.NoError(t, cfg.Validate())
+
+	require.Equal(t, Permissions{}, cfg.Users[0].Permissions)
+	require.Len(t, cfg.Users[0].Rules, 1)
+	require.Equal(t, "/secret", cfg.Users[0].Rules[0].Path)
+}
+
+func TestConfigUserEnvEmptyInherits(t *testing.T) {
+	t.Setenv("WD_USERS_0_PERMISSIONS", "")
+	t.Setenv("WD_USERS_0_RULESBEHAVIOR", "")
+	t.Setenv("WD_USERS_0_RULES", "")
+
+	cfg := writeAndParseConfig(t, `
+directory: /
+permissions: CRUD
+rulesBehavior: append
+rules:
+  - path: /secret
+    permissions: none
+users:
+  - username: foo
+    password: bar`, ".yml")
+	require.NoError(t, cfg.Validate())
+
+	require.Equal(t, cfg.Permissions, cfg.Users[0].Permissions)
+	require.Equal(t, RulesAppend, cfg.Users[0].RulesBehavior)
+	require.Len(t, cfg.Users[0].Rules, 1)
+	require.Equal(t, "/secret", cfg.Users[0].Rules[0].Path)
+}
+
+func TestConfigUserFileOverrides(t *testing.T) {
+	t.Parallel()
+
+	cfg := writeAndParseConfig(t, `
+directory: /
+permissions: CRUD
+rulesBehavior: append
+rules:
+  - path: /secret
+    permissions: none
+users:
+  - username: none
+    password: none
+    permissions: none
+  - username: overwrite
+    password: overwrite
+    rulesBehavior: overwrite
+    rules:
+      - path: /mine
+  - username: empty
+    password: empty
+    rules:`, ".yml")
+	require.NoError(t, cfg.Validate())
+
+	require.Equal(t, Permissions{}, cfg.Users[0].Permissions)
+	require.Len(t, cfg.Users[0].Rules, 1)
+
+	require.Equal(t, RulesOverwrite, cfg.Users[1].RulesBehavior)
+	require.Len(t, cfg.Users[1].Rules, 1)
+	require.Equal(t, "/mine", cfg.Users[1].Rules[0].Path)
+
+	require.Equal(t, cfg.Permissions, cfg.Users[2].Permissions)
+	require.Len(t, cfg.Users[2].Rules, 1)
+	require.Equal(t, "/secret", cfg.Users[2].Rules[0].Path)
+}
+
 func TestConfigKeys(t *testing.T) {
 	t.Parallel()
 
@@ -541,4 +702,43 @@ users:
 
 	require.True(t, cfg.Users[0].checkPassword("admin"))
 	require.True(t, cfg.Users[1].checkPassword("basic"))
+}
+
+func TestConfigDuplicateUsernames(t *testing.T) {
+	t.Run("Literal", func(t *testing.T) {
+		t.Parallel()
+
+		writeAndParseConfigWithError(t, `
+users:
+  - username: alice
+    password: one
+  - username: alice
+    password: two
+`, ".yml", `duplicate username "alice"`)
+	})
+
+	t.Run("Environment", func(t *testing.T) {
+		t.Setenv("COLLIDE_USERNAME", "alice")
+
+		writeAndParseConfigWithError(t, `
+users:
+  - username: alice
+    password: one
+  - username: '{env}COLLIDE_USERNAME'
+    password: two
+`, ".yml", `duplicate username "alice"`)
+	})
+
+	t.Run("Case Sensitive", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := writeAndParseConfig(t, `
+users:
+  - username: alice
+    password: one
+  - username: Alice
+    password: two
+`, ".yml")
+		require.Len(t, cfg.Users, 2)
+	})
 }

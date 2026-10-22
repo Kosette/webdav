@@ -1462,6 +1462,179 @@ rules:
 	require.FileExists(t, filepath.Join(dirA, "secret", "flag.txt"))
 }
 
+// TestServerRulesDestinationOverwriteDescendants covers a COPY or MOVE onto an
+// existing collection, which replaces it: the server deletes the destination
+// with "Depth: infinity" first, reaching descendants that authorizing only the
+// destination itself let it destroy.
+func TestServerRulesDestinationOverwriteDescendants(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"shared/protected/confidential.txt": []byte("top secret"),
+		"empty/.keep":                       []byte(""),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: CRUD
+rules:
+  - path: "/shared/protected/"
+    permissions: R
+`, dir))
+	defer srv.Close()
+
+	confidential := filepath.Join(dir, "shared", "protected", "confidential.txt")
+
+	// Controls: the rule holds when the request names the denied subtree.
+	code, _ := doRequest(t, "DELETE", srv.URL+"/shared/protected/confidential.txt", "", "", nil, "")
+	require.Equal(t, http.StatusForbidden, code)
+
+	code, _ = doRequest(t, "DELETE", srv.URL+"/shared/", "", "", nil, "")
+	require.Equal(t, http.StatusForbidden, code)
+
+	// Overwriting the collection above the rule destroys the denied subtree, so
+	// it is refused for the same reason DELETE is.
+	code, _ = doRequest(t, "MOVE", srv.URL+"/empty/", "", "", map[string]string{
+		"Destination": srv.URL + "/shared/",
+		"Overwrite":   "T",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+
+	// COPY overwrites unless the header says otherwise, so it needs no Overwrite.
+	code, _ = doRequest(t, "COPY", srv.URL+"/empty/", "", "", map[string]string{
+		"Destination": srv.URL + "/shared/",
+		"Depth":       "infinity",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+
+	require.FileExists(t, confidential)
+}
+
+// TestServerRulesDestinationOverwriteDescendantsMultiDir is the same defect
+// across mounts, where the destination collection lives under another mount.
+func TestServerRulesDestinationOverwriteDescendantsMultiDir(t *testing.T) {
+	t.Parallel()
+
+	dirA := makeTestDirectory(t, map[string][]byte{"shared/protected/flag.txt": []byte("mount secret")})
+	dirB := makeTestDirectory(t, map[string][]byte{"empty/.keep": []byte("")})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+permissions: CRUD
+directories:
+  - name: alpha
+    path: %s
+  - name: beta
+    path: %s
+rules:
+  - path: "/alpha/shared/protected/"
+    permissions: R
+`, dirA, dirB))
+	defer srv.Close()
+
+	code, _ := doRequest(t, "MOVE", srv.URL+"/beta/empty/", "", "", map[string]string{
+		"Destination": srv.URL + "/alpha/shared/",
+		"Overwrite":   "T",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+
+	code, _ = doRequest(t, "COPY", srv.URL+"/beta/empty/", "", "", map[string]string{
+		"Destination": srv.URL + "/alpha/shared/",
+		"Depth":       "infinity",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+
+	require.FileExists(t, filepath.Join(dirA, "shared", "protected", "flag.txt"))
+}
+
+// TestServerRulesDestinationOverwriteRequiresDelete covers the permission class
+// the overwrite is authorized under. Removing a collection is delete-class, so a
+// rule that grants writes but withholds D refuses the overwrite, whether it
+// governs the destination itself or something beneath it.
+func TestServerRulesDestinationOverwriteRequiresDelete(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"empty/.keep":       []byte(""),
+		"empty2/.keep":      []byte(""),
+		"nodelete/note.txt": []byte("kept by the rule on the collection"),
+		"shared/keep/n.txt": []byte("kept by the rule on a descendant"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: CRUD
+rules:
+  - path: "/nodelete/"
+    permissions: CRU
+  - path: "/shared/keep/"
+    permissions: CRU
+`, dir))
+	defer srv.Close()
+
+	// The rule governs the destination collection itself.
+	code, _ := doRequest(t, "MOVE", srv.URL+"/empty/", "", "", map[string]string{
+		"Destination": srv.URL + "/nodelete/",
+		"Overwrite":   "T",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+	require.FileExists(t, filepath.Join(dir, "nodelete", "note.txt"))
+
+	// The rule governs a descendant of the destination collection.
+	code, _ = doRequest(t, "MOVE", srv.URL+"/empty2/", "", "", map[string]string{
+		"Destination": srv.URL + "/shared/",
+		"Overwrite":   "T",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+	require.FileExists(t, filepath.Join(dir, "shared", "keep", "n.txt"))
+}
+
+// TestServerDestinationOverwriteAllowed pins what overwriting a destination is
+// still allowed to do, so the delete-class check on collections does not spread
+// to writing over a file. Replacing a file is update-class, the same class PUT
+// over an existing file needs, which clients rely on when they save by writing a
+// temporary file and moving it over the target.
+func TestServerDestinationOverwriteAllowed(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"empty/.keep":       []byte(""),
+		"empty2/.keep":      []byte(""),
+		"plain/note.txt":    []byte("plain"),
+		"updatable/doc.txt": []byte("updatable"),
+		"source.txt":        []byte("source"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: CRUD
+rules:
+  - path: "/updatable/doc.txt"
+    permissions: RU
+`, dir))
+	defer srv.Close()
+
+	// No rule withholds D anywhere under the destination.
+	code, _ := doRequest(t, "MOVE", srv.URL+"/empty/", "", "", map[string]string{
+		"Destination": srv.URL + "/plain/",
+		"Overwrite":   "T",
+	}, "")
+	require.Equal(t, http.StatusNoContent, code)
+
+	// A destination that does not exist is created, not overwritten.
+	code, _ = doRequest(t, "MOVE", srv.URL+"/empty2/", "", "", map[string]string{
+		"Destination": srv.URL + "/fresh/",
+		"Overwrite":   "T",
+	}, "")
+	require.Equal(t, http.StatusCreated, code)
+
+	// A file destination needs only the U its rule grants, not D.
+	code, _ = doRequest(t, "MOVE", srv.URL+"/source.txt", "", "", map[string]string{
+		"Destination": srv.URL + "/updatable/doc.txt",
+		"Overwrite":   "T",
+	}, "")
+	require.Equal(t, http.StatusNoContent, code)
+}
+
 // TestServerLockRequiresWritePermission covers LOCK being authorized by any
 // permission at all, which let a read-only user create a file by locking a
 // missing path, and hold a write lock that blocks legitimate writers.
@@ -1587,4 +1760,271 @@ rules:
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
+}
+
+func TestServerListingEnabled(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"file1.txt":   []byte("content1"),
+		"file2.txt":   []byte("content2"),
+		"subdir/test": []byte("test"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: R
+listing:
+  enabled: true
+`, dir))
+	defer srv.Close()
+
+	// Test GET request to root - should return HTML
+	resp, err := http.Get(srv.URL + "/")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+
+	require.Contains(t, bodyStr, "<!DOCTYPE html>")
+	require.Contains(t, bodyStr, "file1.txt")
+	require.Contains(t, bodyStr, "file2.txt")
+	require.Contains(t, bodyStr, "subdir")
+	require.Contains(t, bodyStr, `<table id="list">`)
+}
+
+func TestServerListingHideParentDir(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"subdir/file.txt": []byte("content"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: R
+listing:
+  enabled: true
+  hide_parent_dir: true
+`, dir))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/subdir/")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+
+	require.NotContains(t, bodyStr, `href="../"`)
+	require.Contains(t, bodyStr, `td colspan="2" class="link"`)
+	require.Contains(t, bodyStr, `td class="size"`)
+	require.Contains(t, bodyStr, `td class="date"`)
+}
+
+func TestServerListingDisabled(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"file1.txt": []byte("content1"),
+	})
+
+	for name, extra := range map[string]string{
+		"Default":  "",
+		"Explicit": "listing:\n  enabled: false\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := makeTestServer(t, fmt.Sprintf("directory: %s\npermissions: R\n%s", dir, extra))
+			defer srv.Close()
+
+			// Test GET request to root - should return 207 Multi-Status (PROPFIND)
+			resp, err := http.Get(srv.URL + "/")
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+
+			require.Equal(t, http.StatusMultiStatus, resp.StatusCode)
+			require.Contains(t, resp.Header.Get("Content-Type"), "text/xml")
+		})
+	}
+}
+
+func TestServerListingWithHeader(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"file.txt": []byte("content"),
+	})
+
+	customHeader := "<!DOCTYPE html><html><head></head><body><h1>Welcome to my WebDAV Server</h1>"
+	customFooter := "</body></html>"
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: R
+listing:
+  enabled: true
+  header: %q
+  footer: %q
+`, dir, customHeader, customFooter))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+
+	require.Contains(t, bodyStr, customHeader)
+	require.NotContains(t, bodyStr, "Index of")
+}
+
+func TestServerListingRedirectsToTrailingSlash(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"subdir/file.txt":     []byte("content"),
+		"evil.com/file.txt":   []byte("content"),
+		"with space/file.txt": []byte("content"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: R
+listing:
+  enabled: true
+`, dir))
+	defer srv.Close()
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	for requestPath, location := range map[string]string{
+		"/subdir":         "/subdir/",
+		"/subdir?C=S&O=A": "/subdir/?C=S&O=A",
+		"//evil.com":      "/evil.com/",
+		"/with%20space":   "/with%20space/",
+	} {
+		resp, err := client.Get(srv.URL + requestPath)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusMovedPermanently, resp.StatusCode, requestPath)
+		require.Equal(t, location, resp.Header.Get("Location"), requestPath)
+	}
+}
+
+func TestServerListingWithFooter(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"file.txt": []byte("content"),
+	})
+
+	customHeader := "<!DOCTYPE html><html><head></head><body>"
+	customFooter := "<p>Copyright 2026 - My Company</p></body></html>"
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: R
+listing:
+  enabled: true
+  header: %q
+  footer: %q
+`, dir, customHeader, customFooter))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+
+	require.Contains(t, bodyStr, customFooter)
+}
+
+func TestServerListingSortQuery(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"small.txt":  []byte("1"),
+		"medium.txt": []byte("12345"),
+		"large.txt":  []byte("123456789"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: R
+listing:
+  enabled: true
+`, dir))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/?C=S&O=D")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+
+	largePos := strings.Index(bodyStr, "large.txt")
+	mediumPos := strings.Index(bodyStr, "medium.txt")
+	smallPos := strings.Index(bodyStr, "small.txt")
+	require.True(t, largePos >= 0 && mediumPos >= 0 && smallPos >= 0)
+	require.True(t, largePos < mediumPos && mediumPos < smallPos)
+}
+
+func TestServerListingHidesForbiddenEntries(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"public.txt":      []byte("public"),
+		"secret/flag.txt": []byte("flag"),
+		"hidden.txt":      []byte("hidden"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: R
+listing:
+  enabled: true
+rules:
+  - path: /secret/
+    permissions: none
+  - path: /hidden.txt
+    permissions: none
+`, dir))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+
+	require.Contains(t, bodyStr, "public.txt")
+	require.NotContains(t, bodyStr, "secret")
+	require.NotContains(t, bodyStr, "hidden.txt")
+
+	resp, err = http.Get(srv.URL + "/secret/")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
