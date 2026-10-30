@@ -1,28 +1,36 @@
 package lib
 
 import (
+	"crypto/sha256"
 	"net/http"
 	"os"
 	"path"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/rs/cors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/net/webdav"
 )
 
 type handlerUser struct {
 	User
-	handler webdav.Handler
-	fs      permissionsFS
+	handler  webdav.Handler
+	fs       permissionsFS
+	verified atomic.Pointer[[sha256.Size]byte]
 }
 
 type Handler struct {
 	noPassword  bool
 	behindProxy bool
+	hsts        string
 	listing     Listing
 	user        *handlerUser
 	users       map[string]*handlerUser
+	// decoyHash is checked for unknown users and plaintext passwords, so all take as long to refuse.
+	decoyHash []byte
 }
 
 func NewHandler(c *Config) (http.Handler, error) {
@@ -36,6 +44,7 @@ func NewHandler(c *Config) (http.Handler, error) {
 	h := &Handler{
 		noPassword:  c.NoPassword,
 		behindProxy: c.BehindProxy,
+		hsts:        c.HSTS,
 		listing:     c.Listing,
 		user:        newHandlerUser(User{UserPermissions: c.UserPermissions}, c, ls, logFunc),
 		users:       map[string]*handlerUser{},
@@ -43,6 +52,18 @@ func NewHandler(c *Config) (http.Handler, error) {
 
 	for _, u := range c.Users {
 		h.users[u.Username] = newHandlerUser(u, c, ls, logFunc)
+
+		if hash, ok := strings.CutPrefix(u.Password, "{bcrypt}"); ok && !c.NoPassword {
+			h.decoyHash = []byte(hash)
+		}
+	}
+
+	if len(c.Users) == 0 {
+		zap.L().Warn("unprotected config: no users have been set, so no authentication will be used")
+	}
+
+	if c.NoPassword {
+		zap.L().Warn("unprotected config: password check is disabled, only intended when delegating authentication to another service")
 	}
 
 	if c.CORS.Enabled {
@@ -55,14 +76,6 @@ func NewHandler(c *Config) (http.Handler, error) {
 			ExposedHeaders:      c.CORS.ExposedHeaders,
 			OptionsPassthrough:  false,
 		}).Handler(h), nil
-	}
-
-	if len(c.Users) == 0 {
-		zap.L().Warn("unprotected config: no users have been set, so no authentication will be used")
-	}
-
-	if c.NoPassword {
-		zap.L().Warn("unprotected config: password check is disabled, only intended when delegating authentication to another service")
 	}
 
 	return h, nil
@@ -120,6 +133,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	lZap := getRequestLogger(r, h.behindProxy)
 
+	if h.hsts != "" && r.TLS != nil {
+		w.Header().Set("Strict-Transport-Security", h.hsts)
+	}
+
 	// Authentication
 	if len(h.users) > 0 {
 		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
@@ -133,6 +150,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		user, ok = h.users[username]
 		if !ok {
+			if h.decoyHash != nil {
+				_ = bcrypt.CompareHashAndPassword(h.decoyHash, []byte(password))
+			}
+
 			// Log invalid username
 			lZap.Info("invalid username", zap.String("username", username))
 			http.Error(w, "Not authorized", http.StatusUnauthorized)
@@ -140,6 +161,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !h.noPassword && !user.checkPassword(password) {
+			if h.decoyHash != nil && !strings.HasPrefix(user.Password, "{bcrypt}") {
+				_ = bcrypt.CompareHashAndPassword(h.decoyHash, []byte(password))
+			}
+
 			// Log invalid password
 			lZap.Info("invalid password", zap.String("username", username))
 			http.Error(w, "Not authorized", http.StatusUnauthorized)
@@ -173,11 +198,50 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upstream acts on the lock a token names wherever it is, so it must cover this path.
+	if token := lockToken(r); token != "" {
+		release, err := user.handler.LockSystem.Confirm(time.Now(), req.path, "", webdav.Condition{Token: token})
+		if err != nil {
+			// What upstream answers when no such lock exists.
+			status := http.StatusConflict
+			if r.Method == "LOCK" {
+				status = http.StatusPreconditionFailed
+			}
+			w.WriteHeader(status)
+			return
+		}
+		release()
+	}
+
 	// MOVE and DELETE act on a whole source subtree in one call, so every
 	// descendant needs authorizing here. Reading COPY and PROPFIND out of the
 	// source goes through permFS instead.
-	if r.Method == "MOVE" || r.Method == "DELETE" {
-		ok, err := user.fs.allowedThroughout(r.Context(), req.path, func(p Permissions) bool {
+	//
+	// A LOCK can cover a subtree too. Excerpt from RFC4918, section 9.10.3:
+	//
+	//		If the Depth header is set to infinity, then the resource specified
+	//		in the Request-URI along with all its members, all the way down the
+	//		hierarchy, are to be locked.
+	//
+	//		If no Depth header is submitted on a LOCK request, then the request
+	//		MUST act as if a "Depth:infinity" had been submitted.
+	//
+	// A refresh keeps the scope the lock already has. From section 9.10.2:
+	//
+	//		This request MUST NOT have a body [...]. A server MUST ignore the
+	//		Depth header on a LOCK refresh.
+	//
+	// Section 9.10.3 also asks for a Multi-Status naming the member that failed,
+	// which would disclose a path the rules hide, so this answers 403.
+	if r.Method == "MOVE" || r.Method == "DELETE" ||
+		(r.Method == "LOCK" && r.Header.Get("Depth") != "0" && r.ContentLength != 0) {
+		// A rename also creates every descendant under the destination.
+		var dst string
+		if r.Method == "MOVE" {
+			dst = req.destination
+		}
+
+		ok, err := user.fs.allowedThroughout(r.Context(), req.path, dst, func(p Permissions) bool {
 			return p.Allowed(req, fileExists)
 		})
 		if err != nil {
@@ -221,7 +285,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// than a delete, so that is checked here.
 			ok := user.allowedAt(req.destination, deletable)
 			if ok {
-				ok, err = user.fs.allowedThroughout(r.Context(), req.destination, deletable)
+				ok, err = user.fs.allowedThroughout(r.Context(), req.destination, "", deletable)
 				if err != nil {
 					lZap.Error("could not authorize destination subtree", zap.String("destination", req.destination), zap.Error(err))
 					w.WriteHeader(http.StatusForbidden)
@@ -234,6 +298,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
+		}
+	}
+
+	// Allowed covers the destination itself, not the descendants a copy creates under it.
+	if r.Method == "COPY" && r.Header.Get("Depth") != "0" && req.destination != "" {
+		ok, err := user.fs.creatableThroughout(r.Context(), req.path, req.destination)
+		if err != nil {
+			lZap.Error("could not authorize destination descendants", zap.String("destination", req.destination), zap.Error(err))
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		if !ok {
+			lZap.Info("denied by a rule under the destination", zap.String("method", r.Method), zap.String("destination", req.destination))
+			w.WriteHeader(http.StatusForbidden)
+			return
 		}
 	}
 
@@ -314,8 +394,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Keeps uploaded pages from acting with the viewer's credentials.
+	w.Header().Set("Content-Security-Policy", "sandbox")
+
 	// Runs the WebDAV.
-	user.handler.ServeHTTP(w, r)
+	handler := user.handler
+	if r.Method == "PROPFIND" {
+		handler.FileSystem = propfindFS{FileSystem: handler.FileSystem, infos: map[string]os.FileInfo{}}
+	}
+	handler.ServeHTTP(w, r)
 }
 
 // getRequestLogger creates a zap.Logger using the request remote ip.
@@ -327,13 +414,32 @@ func getRequestLogger(r *http.Request, behindProxy bool) *zap.Logger {
 }
 
 // getRealRemoteIP retrieves the client's actual IP address, considering reverse proxies.
+// Only the last X-Forwarded-For entry, which the proxy appended, is trusted.
 func getRealRemoteIP(r *http.Request, behindProxy bool) string {
-	if behindProxy {
-		if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+	if values := r.Header.Values("X-Forwarded-For"); behindProxy && len(values) > 0 {
+		last := values[len(values)-1]
+		if i := strings.LastIndexByte(last, ','); i >= 0 {
+			last = last[i+1:]
+		}
+
+		if ip := strings.TrimSpace(last); ip != "" {
 			return ip
 		}
 	}
 	return r.RemoteAddr
+}
+
+// lockToken returns the token an UNLOCK or a LOCK refresh names, as upstream reads it.
+func lockToken(r *http.Request) string {
+	switch {
+	case r.Method == "UNLOCK":
+		return strings.TrimSuffix(strings.TrimPrefix(r.Header.Get("Lock-Token"), "<"), ">")
+	case r.Method == "LOCK" && r.ContentLength <= 0:
+		if lists, ok := parsePartialIfHeader(r.Header.Get("If")); ok && len(lists) == 1 && len(lists[0].conditions) == 1 {
+			return lists[0].conditions[0].Token
+		}
+	}
+	return ""
 }
 
 type responseWriterNoBody struct {

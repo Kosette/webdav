@@ -77,3 +77,34 @@ func TestMultiDirLockSystemUsesSlashSeparatedKeys(t *testing.T) {
 	require.Equal(t, path.Join(filepath.ToSlash(mounts[0].Path), "report.txt"), key)
 	require.NotContains(t, key, "\\")
 }
+
+func TestLockSystemRefreshReportsRequestPath(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "data")
+	now := time.Now()
+
+	for name, locks := range map[string]*lockSystem{
+		"/a.txt":      newLockSystem(webdav.NewMemLS(), dir),
+		"/docs/a.txt": newMultiDirLockSystem(webdav.NewMemLS(), DirectoryMounts{{Name: "docs", Path: dir}}),
+	} {
+		token, err := locks.Create(now, webdav.LockDetails{Root: name, Duration: time.Minute})
+		require.NoError(t, err)
+
+		details, err := locks.Refresh(now, token, time.Minute)
+		require.NoError(t, err)
+		require.Equal(t, name, details.Root)
+	}
+
+	_, ok := trimDir("/database/a.txt", "/data")
+	require.False(t, ok)
+
+	name, ok := trimDir("/a.txt", "/")
+	require.True(t, ok)
+	require.Equal(t, "/a.txt", name)
+
+	// Upstream roots a Windows path the way it roots any other name.
+	name, ok = trimDir("/C:/data/a.txt", "C:/data")
+	require.True(t, ok)
+	require.Equal(t, "/a.txt", name)
+}

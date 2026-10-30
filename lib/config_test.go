@@ -53,7 +53,7 @@ func TestConfigDefaults(t *testing.T) {
 	require.Equal(t, dir, cfg.Directory)
 
 	require.EqualValues(t, []string{"*"}, cfg.CORS.AllowedHosts)
-	require.EqualValues(t, []string{"Authorization", "Content-Type", "Content-Range", "Depth", "Destination", "If", "Lock-Token", "Overwrite", "X-Update-Range"}, cfg.CORS.AllowedHeaders)
+	require.EqualValues(t, []string{"Authorization", "Content-Type", "Content-Range", "Depth", "Destination", "If", "Lock-Token", "Overwrite", "Timeout", "Translate", "X-Update-Range"}, cfg.CORS.AllowedHeaders)
 	require.EqualValues(t, []string{"COPY", "DELETE", "GET", "HEAD", "LOCK", "MKCOL", "MOVE", "OPTIONS", "PATCH", "POST", "PROPFIND", "PROPPATCH", "PUT", "UNLOCK"}, cfg.CORS.AllowedMethods)
 	require.False(t, cfg.Listing.Enabled)
 	require.False(t, cfg.Listing.HideParentDir)
@@ -580,6 +580,19 @@ rules:
 		require.Nil(t, cfg.Rules[1].Regex)
 	})
 
+	t.Run("Unclean Path", func(t *testing.T) {
+		for _, p := range []string{"secret/", "./secret/", "/secret//", "/public/../secret/"} {
+			content := `
+directory: /
+rules:
+  - path: ` + p
+
+			cfg := writeAndParseConfig(t, content, ".yaml")
+			require.NoError(t, cfg.Validate())
+			require.Equal(t, "/secret/", cfg.Rules[0].Path, p)
+		}
+	})
+
 	t.Run("Rules Behavior (Default: Overwrite)", func(t *testing.T) {
 		content := `
 directory: /
@@ -674,6 +687,25 @@ func TestConfigEnv(t *testing.T) {
 	require.NoError(t, os.Setenv("WD_DIRECTORY", ""))
 }
 
+func TestConfigInvalidHSTS(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"31536000", "yes"} {
+		writeAndParseConfigWithError(t, "directory: /\nhsts: "+value, ".yml", "hsts must be")
+	}
+}
+
+func TestConfigMalformedBcryptHash(t *testing.T) {
+	t.Parallel()
+
+	writeAndParseConfigWithError(t, `
+directory: /
+users:
+  - username: basic
+    password: "{bcrypt}$2y$10$abc"
+`, ".yml", `invalid user "basic"`)
+}
+
 func TestConfigParseUserPasswordEnvironment(t *testing.T) {
 	content := `
 directory: /
@@ -684,7 +716,7 @@ users:
     password: basic
 `
 
-	writeAndParseConfigWithError(t, content, ".yml", "username environment variable is empty")
+	writeAndParseConfigWithError(t, content, ".yml", `invalid user "{env}USER1_USERNAME": username environment variable is empty`)
 
 	err := os.Setenv("USER1_USERNAME", "admin")
 	require.NoError(t, err)

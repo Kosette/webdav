@@ -38,6 +38,7 @@ type Config struct {
 	NoSniff         bool
 	NoPassword      bool
 	BehindProxy     bool
+	HSTS            string
 	Log             Log
 	CORS            CORS
 	Listing         Listing
@@ -87,11 +88,12 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 	v.SetDefault("Debug", false)
 	v.SetDefault("NoSniff", false)
 	v.SetDefault("NoPassword", false)
+	v.SetDefault("HSTS", "")
 	v.SetDefault("Log.Format", "console")
 	v.SetDefault("Log.Outputs", []string{"stderr"})
 	v.SetDefault("Log.Colors", true)
 	v.SetDefault("CORS.Allowed_Hosts", []string{"*"})
-	v.SetDefault("CORS.Allowed_Headers", []string{"Authorization", "Content-Type", "Content-Range", "Depth", "Destination", "If", "Lock-Token", "Overwrite", "X-Update-Range"})
+	v.SetDefault("CORS.Allowed_Headers", []string{"Authorization", "Content-Type", "Content-Range", "Depth", "Destination", "If", "Lock-Token", "Overwrite", "Timeout", "Translate", "X-Update-Range"})
 	v.SetDefault("CORS.Allowed_Methods", []string{"COPY", "DELETE", "GET", "HEAD", "LOCK", "MKCOL", "MOVE", "OPTIONS", "PATCH", "POST", "PROPFIND", "PROPPATCH", "PUT", "UNLOCK"})
 	v.SetDefault("Listing.Enabled", false)
 	v.SetDefault("Listing.Hide_Parent_Dir", false)
@@ -237,11 +239,6 @@ func envKey(key string) string {
 func (c *Config) Validate() error {
 	var err error
 
-	c.Directory, err = filepath.Abs(c.Directory)
-	if err != nil {
-		return fmt.Errorf("invalid config: %w", err)
-	}
-
 	if c.TLS {
 		if c.Cert == "" {
 			return errors.New("invalid config: Cert must be defined if TLS is activated")
@@ -260,6 +257,19 @@ func (c *Config) Validate() error {
 		if err != nil {
 			return fmt.Errorf("invalid config: %w", err)
 		}
+	}
+
+	// A boolean arrives as "1" or "0", since the field is weakly typed.
+	switch strings.ToLower(c.HSTS) {
+	case "true", "1":
+		c.HSTS = "max-age=31536000"
+	case "false", "0":
+		c.HSTS = ""
+	}
+
+	// Browsers ignore the header without max-age.
+	if c.HSTS != "" && !strings.Contains(strings.ToLower(c.HSTS), "max-age=") {
+		return errors.New("invalid config: hsts must be true, false or a header value with max-age")
 	}
 
 	err = c.UserPermissions.Validate()
@@ -313,10 +323,6 @@ func decodeDirectoryMounts(data any) (DirectoryMounts, error) {
 	switch value := data.(type) {
 	case nil:
 		return DirectoryMounts{}, nil
-	case DirectoryMounts:
-		return value, nil
-	case []DirectoryMount:
-		return DirectoryMounts(value), nil
 	case string:
 		if value == "" {
 			return DirectoryMounts{}, nil
@@ -340,12 +346,6 @@ func decodeDirectoryMounts(data any) (DirectoryMounts, error) {
 				return nil, err
 			}
 			mounts = append(mounts, mount)
-		}
-		return mounts, nil
-	case []string:
-		mounts := make(DirectoryMounts, 0, len(value))
-		for _, item := range value {
-			mounts = append(mounts, DirectoryMount{Path: item})
 		}
 		return mounts, nil
 	default:

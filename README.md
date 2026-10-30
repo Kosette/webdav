@@ -1,6 +1,8 @@
 # webdav
 
 [![Version](https://img.shields.io/github/release/hacdias/webdav.svg?style=flat-square)](https://github.com/hacdias/webdav/releases/latest)
+[![Release Downloads](https://img.shields.io/github/downloads/hacdias/webdav/total?style=flat-square&label=release%20downloads)](https://github.com/hacdias/webdav/releases)
+[![GHCR Pulls](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fipitio.github.io%2Fbackage%2Fhacdias%2Fwebdav%2Fwebdav.json&query=%24.downloads&label=ghcr%20pulls&style=flat-square)](https://github.com/hacdias/webdav/pkgs/container/webdav)
 [![Docker Pulls](https://img.shields.io/docker/pulls/hacdias/webdav?style=flat-square)](https://hub.docker.com/r/hacdias/webdav)
 
 A simple and standalone [WebDAV](https://en.wikipedia.org/wiki/WebDAV) server.
@@ -86,6 +88,13 @@ tls: false
 cert: cert.pem
 key: key.pem
 
+# Send a Strict-Transport-Security header on HTTPS responses, so browsers only
+# use HTTPS with this host. Set to true for 'max-age=31536000' (a year), or to
+# the header value, such as 'max-age=31536000; includeSubDomains'. Only applies
+# when this server handles TLS itself: behind a proxy, set the header there.
+# Default is 'false'.
+hsts: false
+
 # Prefix to apply to the WebDAV path-ing. Default is '/'.
 prefix: /
 
@@ -96,8 +105,8 @@ debug: false
 noSniff: false
 
 # Whether the server runs behind a trusted proxy or not. When this is true,
-# the header X-Forwarded-For will be used for logging the remote addresses
-# of logging attempts (if available).
+# the last entry of the X-Forwarded-For header, which the proxy appends, is
+# logged as the remote address (if available).
 behindProxy: false
 
 # The directory that will be able to be accessed by the users when connecting.
@@ -240,7 +249,7 @@ users:
         permissions: CRUD
       # With this rule, the user CAN read and update all files ending with .js.
       # It uses a regular expression.
-      - regex: "^.+.js$"
+      - regex: '^.+\.js$'
         permissions: RU
   # Example user for android SeedVault backuping
   - username: android
@@ -256,21 +265,23 @@ users:
 
 ### Rules
 
-Rules are matched against the request path after dot segments have been resolved, so `/public/../secret/file` is matched as `/secret/file`. The last rule that matches wins.
+Rules are matched against the request path after dot segments have been resolved, so `/public/../secret/file` is matched as `/secret/file`. A `path` rule is cleaned the same way, so `./secret/` means `/secret/`. The last rule that matches wins.
 
 A `path` rule is a prefix match. A rule written with a trailing slash also covers the collection it names, so `path: /secret/` applies to a request for `/secret` as well. Such a rule can only restrict that collection: acting on the collection itself also requires the permissions that apply outside the rule, since the operation takes place in the parent collection.
 
 A `regex` rule is matched literally against the path, and gets none of the above handling. In particular `regex: "^/secret/"` does **not** match a request for `/secret` itself. Write `regex: "^/secret(/|$)"` if you want to cover the collection too.
 
-Rules apply to every path an operation touches, not only the one it names. Collection listings leave out entries the rules deny, copying a collection leaves those entries behind, and a `MOVE` or `DELETE` that would act on a denied descendant is refused outright.
+Rules apply to every path an operation touches, not only the one it names. Collection listings leave out entries the rules deny, copying a collection leaves those entries behind, and a `MOVE` or `DELETE` that would act on a denied descendant is refused outright. A `COPY` or `MOVE` also needs `C` on every path it creates under the destination.
 
 Overwriting a destination is authorized for what it destroys. A `COPY` or `MOVE` onto an existing destination replaces it: RFC4918 has `MOVE` perform a `DELETE` with `Depth: infinity` on the destination first, and requires an overwritten collection to end up with exactly the membership the source had, so either way whatever was there is gone. Replacing a file needs `U` on it, the same permission `PUT` needs. Replacing a collection removes everything it holds, so it needs `D` on that collection and on every path beneath it: a rule withholding `D` anywhere under a destination refuses the overwrite outright, even where it grants `C` and `U`.
 
 Rules follow the case sensitivity of the file system, which each served directory is probed for at startup. Where names are case-insensitive, as on APFS and NTFS, `path: /secret/` also covers `/SECRET/`, a `regex` is matched against the folded path as well as the path as written, and Unicode normal forms count as one name. Elsewhere rules are matched exactly, since `/secret` and `/SECRET` are then different directories.
 
+On Windows, a request for a name that Windows would open as a different file is refused with `400 Bad Request`, since a rule written for the real name would not cover it. That is a name containing `\` or `:`, ending in `.` or a space, a device name such as `CON`, or one shaped like an 8.3 short name such as `SECRET~1` or `REPORT~1.TXT`. Files whose real names look like that cannot be reached on Windows. Short names also resolve on some file systems elsewhere, such as FAT32 drives on Linux and Windows folders bind-mounted into Docker Desktop: don't rely on rules there, or disable 8.3 names on the volume with `fsutil 8dot3name set`.
+
 ### CORS
 
-The `allowed_*` properties are optional, the default value for each of them will be `*`. `exposed_headers` is optional as well, but is not set if not defined. Setting `allow_private_network` to `true` to allow Private-Network-Access preflight requests. Setting `credentials` to `true` will allow you to:
+The `allowed_*` properties are optional and default to the values in the example above. `exposed_headers` is optional as well, but is not set if not defined. Setting `allow_private_network` to `true` to allow Private-Network-Access preflight requests. Setting `credentials` to `true`, with specific origins in `allowed_hosts` since browsers refuse credentials when `*` is allowed, will allow you to:
 
 1. Use `withCredentials = true` in javascript.
 2. Use the `username:password@host` syntax.
@@ -392,9 +403,9 @@ Create a new filter rule under `filter.d/webdav.conf`:
 before = common.conf
 
 [Definition]
-# Failregex to match "invalid password" and extract remote_address only
-failregex = ^.*invalid password\s*\{.*"remote_address":\s*"<HOST>:\d+"\s*\}
-            ^.*invalid username\s*\{.*"remote_address":\s*"<HOST>:\d+"\s*\}
+# Failregex to match failed logins and extract remote_address only. With
+# behindProxy, the address is logged without a port.
+failregex = ^.*invalid (?:password|username)\s*\{.*"remote_address":\s*"<HOST>(?::\d+)?"
 
 ignoreregex =
 ```

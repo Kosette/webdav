@@ -507,6 +507,47 @@ func TestServerPartialUpdateHonorsLocks(t *testing.T) {
 	}
 }
 
+func TestServerHSTS(t *testing.T) {
+	t.Parallel()
+
+	for value, want := range map[string]string{
+		"false":                           "",
+		"true":                            "max-age=31536000",
+		`"max-age=60; includeSubDomains"`: "max-age=60; includeSubDomains",
+	} {
+		handler, err := NewHandler(writeAndParseConfig(t, fmt.Sprintf("directory: %s\nhsts: %s", t.TempDir(), value), ".yml"))
+		require.NoError(t, err)
+
+		for _, srv := range []*httptest.Server{httptest.NewServer(handler), httptest.NewTLSServer(handler)} {
+			resp, err := srv.Client().Get(srv.URL)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			expected := want
+			if srv.TLS == nil {
+				expected = ""
+			}
+			require.Equal(t, expected, resp.Header.Get("Strict-Transport-Security"), value)
+			srv.Close()
+		}
+	}
+}
+
+func TestServerSandboxesFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"page.html": []byte("<script>fetch('/')</script>"),
+	})
+	srv := makeTestServer(t, "directory: "+dir)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/page.html")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "sandbox", resp.Header.Get("Content-Security-Policy"))
+}
+
 func TestServerListingCharacters(t *testing.T) {
 	t.Parallel()
 
@@ -951,6 +992,49 @@ rules:
 	require.ErrorContains(t, err, "403")
 }
 
+func TestServerMultiDirectoriesBackslash(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS != "windows" {
+		t.Skip("backslash is a separator only on Windows")
+	}
+
+	root := makeTestDirectory(t, map[string][]byte{
+		"outside.txt":    []byte("outside"),
+		"alpha/mine.txt": []byte("mine"),
+		"beta":           nil,
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+permissions: CRUD
+directories:
+  - alpha: %s
+  - beta: %s
+`, filepath.Join(root, "alpha"), filepath.Join(root, "beta")))
+	defer srv.Close()
+
+	move := func(source, destination string) int {
+		req, err := http.NewRequest("MOVE", srv.URL+source, nil)
+		require.NoError(t, err)
+		req.Header.Set("Destination", destination)
+
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		return resp.StatusCode
+	}
+
+	// Out of every mount, and into one.
+	require.Equal(t, http.StatusBadRequest, move("/alpha/x%5C..%5C..%5Coutside.txt", "/beta/stolen.txt"))
+	require.FileExists(t, filepath.Join(root, "outside.txt"))
+	require.NoFileExists(t, filepath.Join(root, "beta", "stolen.txt"))
+
+	// Into a mount, and out of every one.
+	require.Equal(t, http.StatusBadRequest, move("/alpha/mine.txt", "/beta/x%5C..%5C..%5Cplanted.txt"))
+	require.FileExists(t, filepath.Join(root, "alpha", "mine.txt"))
+	require.NoFileExists(t, filepath.Join(root, "planted.txt"))
+}
+
 func TestServerMultiDirectoriesPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -1174,6 +1258,70 @@ rules:
 		// access control there is.
 		require.Equal(t, http.StatusForbidden, do(t, "GET", srv.URL+"/public/%2e%2e/secret/flag.txt", nil))
 	})
+}
+
+func TestServerRulesWindowsAliases(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS != "windows" {
+		t.Skip("only Windows opens these names as another file")
+	}
+
+	do := func(t *testing.T, method, url string, header map[string]string) int {
+		t.Helper()
+
+		req, err := http.NewRequest(method, url, nil)
+		require.NoError(t, err)
+		for k, v := range header {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		return resp.StatusCode
+	}
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"public/pub.txt":    []byte("public"),
+		"supersecret/f.txt": []byte("secret"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: CRUD
+rules:
+  - path: "/supersecret/"
+    permissions: none
+`, dir))
+	defer srv.Close()
+
+	// Each names supersecret or a file in it, which the rule must not miss.
+	aliases := []string{
+		"/SUPERS~1/f.txt",
+		"/supersecret./f.txt",
+		"/supersecret%20",
+		"/supersecret::$INDEX_ALLOCATION/f.txt",
+		"/public%5C..%5Csupersecret/f.txt",
+		"/con",
+	}
+
+	for _, alias := range aliases {
+		for _, method := range []string{"GET", "PUT", "DELETE", "PROPFIND"} {
+			require.Equal(t, http.StatusBadRequest, do(t, method, srv.URL+alias, nil), method+" "+alias)
+		}
+
+		code := do(t, "MOVE", srv.URL+"/public/pub.txt", map[string]string{
+			"Destination": alias,
+			"Overwrite":   "T",
+		})
+		require.Equal(t, http.StatusBadRequest, code, "MOVE to "+alias)
+	}
+
+	require.FileExists(t, filepath.Join(dir, "supersecret", "f.txt"))
+	require.FileExists(t, filepath.Join(dir, "public", "pub.txt"))
+	require.Equal(t, http.StatusForbidden, do(t, "GET", srv.URL+"/supersecret/f.txt", nil))
+	require.Equal(t, http.StatusOK, do(t, "GET", srv.URL+"/public/pub.txt", nil))
 }
 
 func TestServerRulesBareCollection(t *testing.T) {
@@ -1426,6 +1574,24 @@ rules:
 	code, _ = doRequest(t, "DELETE", srv.URL+"/secret", "", "", nil, "")
 	require.Equal(t, http.StatusForbidden, code)
 
+	// So does a LOCK, which would reserve the denied descendant against every
+	// other writer. Without a Depth header it defaults to infinity.
+	for _, depth := range []string{"", "infinity"} {
+		code, _ = doRequest(t, "LOCK", srv.URL+"/secret", "", "", map[string]string{"Depth": depth}, exclusiveWriteLock)
+		require.Equal(t, http.StatusForbidden, code, depth)
+	}
+
+	code, body = doRequest(t, "LOCK", srv.URL+"/secret", "", "", map[string]string{"Depth": "0"}, exclusiveWriteLock)
+	require.Equal(t, http.StatusOK, code)
+
+	// A refresh has no body and no Depth, and keeps the scope the lock has.
+	_, token, _ := strings.Cut(body, "<D:locktoken><D:href>")
+	token, _, _ = strings.Cut(token, "</D:href>")
+	require.NotEmpty(t, token)
+
+	code, _ = doRequest(t, "LOCK", srv.URL+"/secret", "", "", map[string]string{"If": "(<" + token + ">)"}, "")
+	require.Equal(t, http.StatusOK, code)
+
 	require.FileExists(t, filepath.Join(dir, "secret", "flag.txt"))
 }
 
@@ -1457,6 +1623,9 @@ rules:
 	require.Equal(t, http.StatusNotFound, code)
 
 	code, _ = doRequest(t, "DELETE", srv.URL+"/alpha/secret", "", "", nil, "")
+	require.Equal(t, http.StatusForbidden, code)
+
+	code, _ = doRequest(t, "LOCK", srv.URL+"/", "", "", nil, exclusiveWriteLock)
 	require.Equal(t, http.StatusForbidden, code)
 
 	require.FileExists(t, filepath.Join(dirA, "secret", "flag.txt"))
@@ -1544,6 +1713,118 @@ rules:
 	require.Equal(t, http.StatusForbidden, code)
 
 	require.FileExists(t, filepath.Join(dirA, "shared", "protected", "flag.txt"))
+}
+
+// TestServerRulesDestinationCreatedDescendants checks COPY and MOVE need Create
+// on every path they create under the destination.
+func TestServerRulesDestinationCreatedDescendants(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"stage/shell.php": []byte("<?php"),
+		"www/index.txt":   []byte("index"),
+		"project/a.txt":   []byte("a"),
+		"project/.env":    []byte("secret"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: CRUD
+rules:
+  - regex: '^/www/.*\.php$'
+    permissions: R
+  - regex: '\.env$'
+    permissions: none
+`, dir))
+	defer srv.Close()
+
+	// Control: the rule holds when the request names the path.
+	code, _ := doRequest(t, "PUT", srv.URL+"/www/shell.php", "", "", nil, "<?php")
+	require.Equal(t, http.StatusForbidden, code)
+
+	code, _ = doRequest(t, "COPY", srv.URL+"/stage/", "", "", map[string]string{
+		"Destination": srv.URL + "/www/copied/",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+	require.NoDirExists(t, filepath.Join(dir, "www", "copied"))
+
+	code, _ = doRequest(t, "MOVE", srv.URL+"/stage/", "", "", map[string]string{
+		"Destination": srv.URL + "/www/moved/",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+	require.NoDirExists(t, filepath.Join(dir, "www", "moved"))
+	require.FileExists(t, filepath.Join(dir, "stage", "shell.php"))
+
+	// A COPY leaves unreadable entries behind, so they need no Create either.
+	code, _ = doRequest(t, "COPY", srv.URL+"/project/", "", "", map[string]string{
+		"Destination": srv.URL + "/project2/",
+	}, "")
+	require.Equal(t, http.StatusCreated, code)
+	require.FileExists(t, filepath.Join(dir, "project2", "a.txt"))
+	require.NoFileExists(t, filepath.Join(dir, "project2", ".env"))
+}
+
+// TestServerDestinationOverwriteRequiresCreate checks the walk is skipped
+// without rules only when the permissions themselves allow creating.
+func TestServerDestinationOverwriteRequiresCreate(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"src/a.txt":   []byte("a"),
+		"dst/old.txt": []byte("old"),
+	})
+
+	srv := makeTestServer(t, "directory: "+dir+"\npermissions: RUD\n")
+	defer srv.Close()
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		code, _ := doRequest(t, method, srv.URL+"/src/", "", "", map[string]string{
+			"Destination": srv.URL + "/dst/",
+			"Overwrite":   "T",
+		}, "")
+		require.Equal(t, http.StatusForbidden, code, method)
+	}
+
+	require.FileExists(t, filepath.Join(dir, "dst", "old.txt"))
+	require.NoFileExists(t, filepath.Join(dir, "dst", "a.txt"))
+}
+
+// TestServerRulesDestinationCreatedThroughLinks checks COPY is authorized for
+// what it copies through a linked directory, as it follows the link.
+func TestServerRulesDestinationCreatedThroughLinks(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"www/index.txt": []byte("index"),
+		"stage/a.txt":   []byte("a"),
+		"loop/a.txt":    []byte("a"),
+	})
+	lib := makeTestDirectory(t, map[string][]byte{"shell.php": []byte("<?php")})
+	if err := os.Symlink(lib, filepath.Join(dir, "stage", "lib")); err != nil {
+		t.Skipf("symbolic links are unavailable: %v", err)
+	}
+	require.NoError(t, os.Symlink(".", filepath.Join(dir, "loop", "self")))
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: CRUD
+rules:
+  - regex: '^/www/.*\.php$'
+    permissions: R
+`, dir))
+	defer srv.Close()
+
+	code, _ := doRequest(t, "COPY", srv.URL+"/stage/", "", "", map[string]string{
+		"Destination": srv.URL + "/www/new/",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
+	require.NoDirExists(t, filepath.Join(dir, "www", "new"))
+
+	// A link loop ends the walk with an error instead of recursing forever.
+	code, _ = doRequest(t, "COPY", srv.URL+"/loop/", "", "", map[string]string{
+		"Destination": srv.URL + "/www/loop/",
+	}, "")
+	require.Equal(t, http.StatusForbidden, code)
 }
 
 // TestServerRulesDestinationOverwriteRequiresDelete covers the permission class
@@ -1675,6 +1956,116 @@ users:
 	// A user who can write still locks as before.
 	require.Equal(t, http.StatusOK, lock("writer", "/existing.txt"))
 	require.Equal(t, http.StatusCreated, lock("writer", "/new.txt"))
+}
+
+// TestServerLockTokenMustCoverPath checks a token cannot unlock or refresh a
+// lock outside the request path, which tokens being sequential makes easy.
+func TestServerLockTokenMustCoverPath(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"a/doc.txt": []byte("alice"),
+		"b/x.txt":   []byte("bob"),
+	})
+
+	srv := makeTestServer(t, fmt.Sprintf(`
+directory: %s
+permissions: none
+users:
+  - username: alice
+    password: alice
+    rules:
+      - path: /a/
+        permissions: CRUD
+  - username: bob
+    password: bob
+    rules:
+      - path: /b/
+        permissions: CRUD
+`, dir))
+	defer srv.Close()
+
+	lock := func(username, path string) string {
+		t.Helper()
+		req, err := http.NewRequest("LOCK", srv.URL+path, strings.NewReader(exclusiveWriteLock))
+		require.NoError(t, err)
+		req.SetBasicAuth(username, username)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		return strings.Trim(resp.Header.Get("Lock-Token"), "<>")
+	}
+
+	alice := lock("alice", "/a/doc.txt")
+	require.NotEqual(t, alice, lock("bob", "/b/x.txt"))
+
+	code, _ := doRequest(t, "UNLOCK", srv.URL+"/b/x.txt", "bob", "bob", map[string]string{"Lock-Token": "<" + alice + ">"}, "")
+	require.Equal(t, http.StatusConflict, code)
+
+	code, _ = doRequest(t, "LOCK", srv.URL+"/b/x.txt", "bob", "bob", map[string]string{"If": "(<" + alice + ">)"}, "")
+	require.Equal(t, http.StatusPreconditionFailed, code)
+
+	code, _ = doRequest(t, "PUT", srv.URL+"/a/doc.txt", "alice", "alice", nil, "overwritten")
+	require.Equal(t, http.StatusLocked, code)
+
+	code, _ = doRequest(t, "UNLOCK", srv.URL+"/a/doc.txt", "alice", "alice", map[string]string{"Lock-Token": "<" + alice + ">"}, "")
+	require.Equal(t, http.StatusNoContent, code)
+}
+
+// TestServerMoveSubmittingSourceToken covers a MOVE that submits only the
+// source's lock token, as Windows does when saving, which failed with 412.
+func TestServerMoveSubmittingSourceToken(t *testing.T) {
+	t.Parallel()
+
+	dir := makeTestDirectory(t, map[string][]byte{
+		"original.txt": []byte("old"),
+		"tmp.txt":      []byte("new"),
+	})
+
+	srv := makeTestServer(t, "directory: "+dir+"\npermissions: CRUD")
+	defer srv.Close()
+
+	lock := func(path string) string {
+		t.Helper()
+		code, body := doRequest(t, "LOCK", srv.URL+path, "", "", map[string]string{"Depth": "0"}, exclusiveWriteLock)
+		require.Equal(t, http.StatusOK, code)
+		_, token, _ := strings.Cut(body, "<D:locktoken><D:href>")
+		token, _, _ = strings.Cut(token, "</D:href>")
+		return token
+	}
+
+	move := func(token string) int {
+		t.Helper()
+		code, _ := doRequest(t, "MOVE", srv.URL+"/tmp.txt", "", "", map[string]string{
+			"Destination": srv.URL + "/original.txt",
+			"Overwrite":   "T",
+			"If":          "(<" + token + ">)",
+		}, "")
+		return code
+	}
+
+	source := lock("/tmp.txt")
+
+	// A destination locked by someone else still refuses it.
+	other := lock("/original.txt")
+	require.Equal(t, http.StatusPreconditionFailed, move(source))
+
+	data, err := os.ReadFile(filepath.Join(dir, "original.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "old", string(data))
+
+	code, _ := doRequest(t, "UNLOCK", srv.URL+"/original.txt", "", "", map[string]string{"Lock-Token": "<" + other + ">"}, "")
+	require.Equal(t, http.StatusNoContent, code)
+
+	require.Equal(t, http.StatusNoContent, move(source))
+
+	data, err = os.ReadFile(filepath.Join(dir, "original.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "new", string(data))
+
+	// The destination is not left locked.
+	lock("/original.txt")
 }
 
 // TestServerRulesCaseInsensitiveFilesystem covers a rule being evaded by asking
@@ -2027,4 +2418,25 @@ rules:
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+func TestGetRealRemoteIP(t *testing.T) {
+	t.Parallel()
+
+	ip := func(behindProxy bool, forwarded ...string) string {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:1234"
+		for _, v := range forwarded {
+			r.Header.Add("X-Forwarded-For", v)
+		}
+		return getRealRemoteIP(r, behindProxy)
+	}
+
+	require.Equal(t, "10.0.0.1:1234", ip(false, "6.6.6.6"))
+	require.Equal(t, "10.0.0.1:1234", ip(true))
+	require.Equal(t, "1.2.3.4", ip(true, "1.2.3.4"))
+
+	// Anything before the proxy's own entry came from the client.
+	require.Equal(t, "1.2.3.4", ip(true, "6.6.6.6, 1.2.3.4"))
+	require.Equal(t, "1.2.3.4", ip(true, "6.6.6.6", "1.2.3.4"))
 }
